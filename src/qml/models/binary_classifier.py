@@ -42,10 +42,10 @@ class HybridQuantumCNN(nn.Module):
         # Input size depends on pool_size parameter
         self.classical = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(pool_size * pool_size, 64),
+            nn.Linear(pool_size * pool_size, 16),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(64, 1)
+            nn.Linear(16, 1)
         )
     
     def forward(self, x):
