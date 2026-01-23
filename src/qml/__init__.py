@@ -8,7 +8,7 @@ from .ansatz.standard import StandardQCNNAnsatz
 from .ansatz.dense import DenseQCNNAnsatz
 from .encoders import QuantumEncoder
 from .layers import QuantumConv2D
-from .models import HybridQuantumCNN
+from .models import HybridQuantumCNN, HybridQuantumMultiClassCNN
 
 __all__ = [
     'QCNNAnsatz',
@@ -17,4 +17,5 @@ __all__ = [
     'QuantumEncoder',
     'QuantumConv2D',
     'HybridQuantumCNN',
+    'HybridQuantumMultiClassCNN',
 ]

@@ -1,15 +1,16 @@
 """
-Hybrid quantum-classical neural network models.
+Binary classification model with quantum convolutional layers.
 """
 import torch.nn as nn
 
-from .layers import QuantumConv2D
+from ..layers import QuantumConv2D
 
 
 class HybridQuantumCNN(nn.Module):
     """
     Neural network with quantum convolutional kernels applied to image patches.
     Supports variable-sized images and different encoding strategies.
+    Binary classification output.
     """
     def __init__(self, kernel_size=2, stride=2, pool_size=8, encoding='ry', ansatz=None, measurement='z'):
         """
