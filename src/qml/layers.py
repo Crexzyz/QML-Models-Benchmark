@@ -190,7 +190,7 @@ class QuantumConv2D(nn.Module):
                         interface='torch'
                     )
                     result = qnode(self.q_params)
-                    batch_features.append(result.float())
+                    batch_features.append(result.float().to(x.device))
             
             # Reshape to feature map
             feature_map = torch.stack(batch_features).reshape(out_h, out_w)

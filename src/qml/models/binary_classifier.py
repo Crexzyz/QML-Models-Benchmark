@@ -12,7 +12,7 @@ class HybridQuantumCNN(nn.Module):
     Supports variable-sized images and different encoding strategies.
     Binary classification output.
     """
-    def __init__(self, kernel_size=2, stride=2, pool_size=8, encoding='ry', ansatz=None, measurement='z'):
+    def __init__(self, kernel_size=2, stride=2, pool_size=8, encoding='ry', ansatz=None, measurement='z', trainable_quantum=True):
         """
         Args:
             kernel_size: Size of quantum convolutional kernel
@@ -21,6 +21,7 @@ class HybridQuantumCNN(nn.Module):
             encoding: Quantum encoding strategy - 'rx', 'ry', 'rz', or 'dense'
             ansatz: QCNNAnsatz instance (defaults to StandardQCNNAnsatz if None)
             measurement: Measurement axis - 'x', 'y', or 'z' (default: 'z')
+            trainable_quantum: Whether quantum layer parameters are trainable (default: True)
         """
         super().__init__()
         
@@ -33,6 +34,9 @@ class HybridQuantumCNN(nn.Module):
             ansatz=ansatz,
             measurement=measurement
         )
+        
+        # Control whether quantum parameters are trainable
+        self.qconv.q_params.requires_grad = trainable_quantum
         
         # Adaptive pooling to handle variable input sizes
         # Reduces to pool_size x pool_size regardless of input size
