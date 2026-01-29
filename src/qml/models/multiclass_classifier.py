@@ -3,7 +3,7 @@ Multiclass classification model with quantum convolutional layers.
 """
 import torch.nn as nn
 
-from ..layers import QuantumConv2D
+from ..layers import QuantumConv2D, BatchedQuantumConv2D, BatchedGPUQuantumConv2D
 
 
 class HybridQuantumMultiClassCNN(nn.Module):
@@ -28,7 +28,7 @@ class HybridQuantumMultiClassCNN(nn.Module):
         super().__init__()
         
         self.num_classes = num_classes
-        
+                    
         # Quantum convolutional layer (slides over image)
         self.qconv = QuantumConv2D(
             kernel_size=kernel_size, 
@@ -67,3 +67,42 @@ class HybridQuantumMultiClassCNN(nn.Module):
         x = self.classical(x)
         
         return x
+
+
+class BatchedHybridQuantumMultiClassCNN(HybridQuantumMultiClassCNN):
+    """
+    Derived class using the optimized BatchedQuantumConv2D layer.
+    """
+    def __init__(self, num_classes, kernel_size=2, stride=2, pool_size=8, hidden_size=64, encoding='ry', ansatz=None, measurement='z', trainable_quantum=True):
+        super().__init__(num_classes, kernel_size, stride, pool_size, hidden_size, encoding, ansatz, measurement, trainable_quantum)
+        
+        # Replace the qconv layer with the batched version
+        # Note: This discards the QuantumConv2D created in super().__init__ which is slightly inefficient but cleaner to implement
+        self.qconv = BatchedQuantumConv2D(
+            kernel_size=kernel_size, 
+            stride=stride, 
+            n_qubits=4,
+            encoding=encoding,
+            ansatz=ansatz,
+            measurement=measurement
+        )
+        self.qconv.q_params.requires_grad = trainable_quantum
+
+
+class BatchedGPUHybridQuantumMultiClassCNN(HybridQuantumMultiClassCNN):
+    """
+    Derived class using the optimized BatchedGPUQuantumConv2D layer.
+    """
+    def __init__(self, num_classes, kernel_size=2, stride=2, pool_size=8, hidden_size=64, encoding='ry', ansatz=None, measurement='z', trainable_quantum=True):
+        super().__init__(num_classes, kernel_size, stride, pool_size, hidden_size, encoding, ansatz, measurement, trainable_quantum)
+        
+        # Replace the qconv layer with the batched GPU version
+        self.qconv = BatchedGPUQuantumConv2D(
+            kernel_size=kernel_size, 
+            stride=stride, 
+            n_qubits=4,
+            encoding=encoding,
+            ansatz=ansatz,
+            measurement=measurement
+        )
+        self.qconv.q_params.requires_grad = trainable_quantum

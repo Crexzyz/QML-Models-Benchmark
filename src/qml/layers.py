@@ -14,6 +14,8 @@ class QuantumConv2D(nn.Module):
     """
     Quantum convolutional layer that applies QCNN as a sliding kernel over image patches.
     Similar to classical Conv2D but using quantum circuits.
+    
+    This is the reference sequential implementation. For performance, use BatchedQuantumConv2D.
     """
     def __init__(self, kernel_size=2, stride=2, n_qubits=4, device_type='lightning.qubit', 
                  encoding='ry', ansatz=None, measurement='z'):
@@ -133,10 +135,10 @@ class QuantumConv2D(nn.Module):
         patches = torch.stack(patches, dim=1)
         return patches, out_h, out_w
 
-    
     def forward(self, x):
         """
         Apply quantum kernel as a sliding window over the image.
+        Sequential execution (slow).
         
         Args:
             x: Tensor of shape (batch_size, channels, height, width)
@@ -190,7 +192,7 @@ class QuantumConv2D(nn.Module):
                         interface='torch'
                     )
                     result = qnode(self.q_params)
-                    batch_features.append(result.float().to(x.device))
+                    batch_features.append(result.float())
             
             # Reshape to feature map
             feature_map = torch.stack(batch_features).reshape(out_h, out_w)
@@ -199,3 +201,106 @@ class QuantumConv2D(nn.Module):
         # Stack all batches: (batch_size, out_h, out_w) -> (batch_size, 1, out_h, out_w)
         output = torch.stack(feature_maps).unsqueeze(1)
         return output
+
+
+class BatchedQuantumConv2D(QuantumConv2D):
+    """
+    Optimized Quantum Convolutional Layer using vectorized patch execution.
+    Much faster than QuantumConv2D for large batches or images.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # Define the QNode for batched execution
+        @qml.qnode(self.dev, interface='torch')
+        def circuit(inputs, weights):
+            self.encode_data(inputs)
+            self.ansatz(weights)
+            return qml.expval(self._observable_fn(self.n_qubits - 1))
+        self.circuit_runner = circuit
+
+    def forward(self, x):
+        """
+        Apply quantum kernel as a sliding window over the image.
+        Batched execution for performance.
+        
+        Args:
+            x: Tensor of shape (batch_size, channels, height, width)
+        
+        Returns:
+            Tensor of shape (batch_size, 1, out_height, out_width)
+        """
+        batch_size, channels, height, width = x.shape
+        
+        # Extract patches
+        patches, out_h, out_w = self.extract_patches(x)
+        # patches shape: (batch_size, out_h, out_w, patch_features)
+        
+        # Flatten for batch processing: (Total_Patches, Features)
+        total_patches = batch_size * out_h * out_w
+        patches_flat = patches.view(total_patches, -1)
+        
+        # Calculate required input size based on encoding
+        if self.encoding == 'dense':
+            required_inputs = self.n_qubits * 3
+        else:  # 'rx', 'ry', or 'rz'
+            required_inputs = self.n_qubits
+            
+        # Vectorized Pre-processing
+        input_dim = patches_flat.shape[1]
+        
+        if input_dim > required_inputs:
+            # Average pooling to reduce dimensions
+            chunk_size = input_dim // required_inputs
+            used_dim = required_inputs * chunk_size
+            # Reshape to (Total, Required, Chunk) and mean over chunk
+            inputs_reduced = patches_flat[:, :used_dim].view(total_patches, required_inputs, chunk_size).mean(dim=2)
+        else:
+            # Pad if needed
+            padding = torch.zeros(total_patches, required_inputs - input_dim, device=x.device)
+            inputs_reduced = torch.cat([patches_flat, padding], dim=1)
+            
+        # Normalize to [-pi, pi] range
+        inputs_norm = torch.tanh(inputs_reduced) * np.pi
+        
+        # Transpose to (Features, Total_Patches) for PennyLane parameter broadcasting
+        # PennyLane iterates over the first dimension of 'inputs' to map to wires/gates
+        # so inputs[i] becomes the vector of feature i across all samples
+        inputs_transposed = inputs_norm.t()
+        
+        # Execute Batched QNode
+        # Returns shape: (Total_Patches,)
+        results = self.circuit_runner(inputs_transposed, self.q_params)
+        
+        # Reshape to feature map: (batch_size, 1, out_h, out_w)
+        output = results.view(batch_size, 1, out_h, out_w).float()
+        
+        return output
+
+
+class BatchedGPUQuantumConv2D(BatchedQuantumConv2D):
+    """
+    Batched Quantum Conv2D specifically optimized for GPU execution.
+    Uses default.qubit with backprop to enable Torch-native GPU simulation.
+    Use this when lightning.gpu is not available but you want to run on GPU.
+    """
+    def __init__(self, kernel_size=2, stride=2, n_qubits=4, encoding='ry', ansatz=None, measurement='z', **kwargs):
+        # Force device_type to default.qubit which supports backprop on GPU
+        super().__init__(
+            kernel_size=kernel_size, 
+            stride=stride, 
+            n_qubits=n_qubits, 
+            device_type='default.qubit', 
+            encoding=encoding, 
+            ansatz=ansatz, 
+            measurement=measurement,
+            **kwargs
+        )
+        
+        # Re-define qnode with diff_method='backprop' to enable GPU support (Torch backend)
+        @qml.qnode(self.dev, interface='torch', diff_method='backprop')
+        def circuit(inputs, weights):
+            self.encode_data(inputs)
+            self.ansatz(weights)
+            return qml.expval(self._observable_fn(self.n_qubits - 1))
+        self.circuit_runner = circuit
