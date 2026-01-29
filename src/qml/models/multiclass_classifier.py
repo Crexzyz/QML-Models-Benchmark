@@ -12,13 +12,14 @@ class HybridQuantumMultiClassCNN(nn.Module):
     Supports variable-sized images and different encoding strategies.
     Multiclass classification output.
     """
-    def __init__(self, num_classes, kernel_size=2, stride=2, pool_size=8, encoding='ry', ansatz=None, measurement='z', trainable_quantum=True):
+    def __init__(self, num_classes, kernel_size=2, stride=2, pool_size=8, hidden_size=64, encoding='ry', ansatz=None, measurement='z', trainable_quantum=True):
         """
         Args:
             num_classes: Number of output classes
             kernel_size: Size of quantum convolutional kernel
             stride: Stride for the quantum convolution
             pool_size: Size for adaptive pooling
+            hidden_size: Number of neurons in the hidden layer (default: 64)
             encoding: Quantum encoding strategy - 'rx', 'ry', 'rz', or 'dense'
             ansatz: QCNNAnsatz instance (defaults to StandardQCNNAnsatz if None)
             measurement: Measurement axis - 'x', 'y', or 'z' (default: 'z')
@@ -49,10 +50,10 @@ class HybridQuantumMultiClassCNN(nn.Module):
         # Input size depends on pool_size parameter
         self.classical = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(pool_size * pool_size, 64),
+            nn.Linear(pool_size * pool_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(64, num_classes)
+            nn.Linear(hidden_size, num_classes)
         )
     
     def forward(self, x):
