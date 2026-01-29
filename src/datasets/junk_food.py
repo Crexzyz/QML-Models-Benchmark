@@ -1,6 +1,7 @@
 """
 Dataset classes for loading and preprocessing image data.
 """
+
 import os
 import json
 import torch
@@ -12,22 +13,22 @@ class JunkFoodDataset(Dataset):
     def __init__(self, data_folder, transform=None):
         """
         Load junk food dataset from COCO annotations.
-        
+
         Args:
             data_folder: Path to folder containing images and _annotations.coco.json
             transform: torchvision transforms (optional)
         """
         self.root_dir = data_folder
         self.transform = transform
-        
+
         # Load annotations
         annotations_path = data_folder + "/_annotations.coco.json"
         with open(annotations_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        
+
         # Create label map from annotations
         label_map = {ann["image_id"]: True for ann in data.get("annotations", [])}
-        
+
         # Build image list with labels
         self.images = [
             {
@@ -35,7 +36,7 @@ class JunkFoodDataset(Dataset):
                 "file_name": img["file_name"],
                 "width": img["width"],
                 "height": img["height"],
-                "has_food": img["id"] in label_map
+                "has_food": img["id"] in label_map,
             }
             for img in data.get("images", [])
         ]
