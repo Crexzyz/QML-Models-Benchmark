@@ -5,9 +5,53 @@ Visualization utilities.
 import matplotlib.pyplot as plt
 
 
+def count_parameters(model):
+    """
+    Count total and trainable parameters in the model.
+
+    Args:
+        model: PyTorch model
+
+    Returns:
+        tuple: (total_params, trainable_params, non_trainable_params)
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
+
+    return total_params, trainable_params, non_trainable_params
+
+
+def print_model_parameters(model):
+    """
+    Print detailed parameter count breakdown for a model.
+
+    Args:
+        model: PyTorch model
+    """
+    total, trainable, non_trainable = count_parameters(model)
+
+    print(f"\n{'='*60}")
+    print("MODEL PARAMETER COUNT")
+    print(f"{'='*60}")
+    print(f"Total parameters:          {total:>12,}")
+    print(f"Trainable parameters:      {trainable:>12,}")
+    print(f"Non-trainable parameters:  {non_trainable:>12,}")
+    print(f"{'='*60}")
+
+    # Breakdown by layer
+    print("\nParameter breakdown by layer:")
+    print(f"{'Layer':<40} {'Parameters':<15} {'Trainable':<10}")
+    print("-" * 65)
+    for name, param in model.named_parameters():
+        trainable_status = "Yes" if param.requires_grad else "No"
+        print(f"{name:<40} {param.numel():<15,} {trainable_status:<10}")
+
+
 def plot_loss_and_accuracy(losses, accuracies, test_losses=None, test_accuracies=None):
     """
-    Plots training (and optionally test) loss and accuracy on the same figure using two y-axes.
+    Plots training (and optionally test) loss and accuracy on the same figure using two
+    y-axes.
 
     Args:
         losses (list of float): Training loss values per epoch
