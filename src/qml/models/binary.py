@@ -24,6 +24,7 @@ class HybridQuantumCNN(nn.Module):
         ansatz=None,
         measurement="z",
         trainable_quantum=True,
+        n_qubits=4,
     ):
         """
         Args:
@@ -35,6 +36,7 @@ class HybridQuantumCNN(nn.Module):
             ansatz: QCNNAnsatz instance (defaults to StandardQCNNAnsatz if None)
             measurement: Measurement axis - 'x', 'y', or 'z' (default: 'z')
             trainable_quantum: Whether to train quantum parameters (default: True)
+            n_qubits: Number of qubits in quantum circuit (default: 4)
         """
         super().__init__()
 
@@ -42,7 +44,7 @@ class HybridQuantumCNN(nn.Module):
         self.qconv = QuantumConv2D(
             kernel_size=kernel_size,
             stride=stride,
-            n_qubits=4,
+            n_qubits=n_qubits,
             encoding=encoding,
             ansatz=ansatz,
             measurement=measurement,
@@ -93,6 +95,7 @@ class BatchedHybridQuantumCNN(HybridQuantumCNN):
         ansatz=None,
         measurement="z",
         trainable_quantum=True,
+        n_qubits=4,
     ):
         super().__init__(
             kernel_size,
@@ -103,13 +106,14 @@ class BatchedHybridQuantumCNN(HybridQuantumCNN):
             ansatz,
             measurement,
             trainable_quantum,
+            n_qubits,
         )
 
         # Replace the qconv layer with the batched version
         self.qconv = BatchedQuantumConv2D(
             kernel_size=kernel_size,
             stride=stride,
-            n_qubits=4,
+            n_qubits=n_qubits,
             encoding=encoding,
             ansatz=ansatz,
             measurement=measurement,
@@ -132,6 +136,7 @@ class BatchedGPUHybridQuantumCNN(HybridQuantumCNN):
         ansatz=None,
         measurement="z",
         trainable_quantum=True,
+        n_qubits=4,
     ):
         super().__init__(
             kernel_size,
@@ -142,13 +147,14 @@ class BatchedGPUHybridQuantumCNN(HybridQuantumCNN):
             ansatz,
             measurement,
             trainable_quantum,
+            n_qubits,
         )
 
         # Replace the qconv layer with the batched GPU version
         self.qconv = BatchedGPUQuantumConv2D(
             kernel_size=kernel_size,
             stride=stride,
-            n_qubits=4,
+            n_qubits=n_qubits,
             encoding=encoding,
             ansatz=ansatz,
             measurement=measurement,
