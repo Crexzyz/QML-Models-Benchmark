@@ -2,9 +2,13 @@
 Multiclass classification model with quantum convolutional layers.
 """
 
+from typing import List, Optional, Union
+
+import torch
 import torch.nn as nn
 
-from ..layers import QuantumConv2D, BatchedQuantumConv2D, BatchedGPUQuantumConv2D
+from ..ansatz.base import QCNNAnsatz
+from ..layers import BatchedGPUQuantumConv2D, BatchedQuantumConv2D, QuantumConv2D
 
 
 class HybridQuantumMultiClassCNN(nn.Module):
@@ -16,33 +20,44 @@ class HybridQuantumMultiClassCNN(nn.Module):
 
     def __init__(
         self,
-        num_classes,
-        kernel_size=2,
-        stride=2,
-        pool_size=8,
-        hidden_size=64,
-        encoding="ry",
-        ansatz=None,
-        measurement="z",
-        trainable_quantum=True,
-        n_qubits=4,
+        num_classes: int,
+        kernel_size: int = 2,
+        stride: int = 2,
+        pool_size: Optional[int] = None,
+        hidden_size: Union[int, List[int]] = 64,
+        encoding: str = "ry",
+        ansatz: Optional[QCNNAnsatz] = None,
+        measurement: str = "z",
+        trainable_quantum: bool = True,
+        n_qubits: int = 4,
+        input_size: Optional[int] = None,
     ):
         """
         Args:
             num_classes: Number of output classes
             kernel_size: Size of quantum convolutional kernel
             stride: Stride for the quantum convolution
-            pool_size: Size for adaptive pooling
-            hidden_size: Number of neurons in the hidden layer (default: 64)
+            pool_size: Size for adaptive pooling. If None and input_size is provided,
+                      calculated automatically to preserve all features.
+            hidden_size: Number of neurons in the hidden layer(s) (default: 64).
+                         Can be an int or a list of ints.
             encoding: Quantum encoding strategy - 'rx', 'ry', 'rz', or 'dense'
             ansatz: QCNNAnsatz instance (defaults to StandardQCNNAnsatz if None)
             measurement: Measurement axis - 'x', 'y', or 'z' (default: 'z')
             trainable_quantum: Whether to train quantum parameters (default: True)
             n_qubits: Number of qubits in quantum circuit (default: 4)
+            input_size: Input image dimension (int). Used to calculate pool_size
+            if not specified.
         """
         super().__init__()
 
         self.num_classes = num_classes
+
+        if pool_size is None:
+            if input_size is not None:
+                pool_size = (input_size - kernel_size) // stride + 1
+            else:
+                pool_size = 8
 
         # Quantum convolutional layer (slides over image)
         self.qconv = QuantumConv2D(
@@ -63,15 +78,25 @@ class HybridQuantumMultiClassCNN(nn.Module):
 
         # Classical layers for final processing
         # Input size depends on pool_size parameter
-        self.classical = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(pool_size * pool_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_size, num_classes),
-        )
+        layers: list[nn.Module] = [nn.Flatten()]
+        input_dim = pool_size * pool_size
 
-    def forward(self, x):
+        if isinstance(hidden_size, int):
+            hidden_sizes = [hidden_size]
+        else:
+            hidden_sizes = hidden_size
+
+        for h_dim in hidden_sizes:
+            layers.append(nn.Linear(input_dim, h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(0.2))
+            input_dim = h_dim
+
+        layers.append(nn.Linear(input_dim, num_classes))
+
+        self.classical = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Apply quantum convolution (acts like Conv2D with quantum kernel)
         x = self.qconv(x)
 
@@ -91,16 +116,17 @@ class BatchedHybridQuantumMultiClassCNN(HybridQuantumMultiClassCNN):
 
     def __init__(
         self,
-        num_classes,
-        kernel_size=2,
-        stride=2,
-        pool_size=8,
-        hidden_size=64,
-        encoding="ry",
-        ansatz=None,
-        measurement="z",
-        trainable_quantum=True,
-        n_qubits=4,
+        num_classes: int,
+        kernel_size: int = 2,
+        stride: int = 2,
+        pool_size: Optional[int] = None,
+        hidden_size: Union[int, List[int]] = 64,
+        encoding: str = "ry",
+        ansatz: Optional[QCNNAnsatz] = None,
+        measurement: str = "z",
+        trainable_quantum: bool = True,
+        n_qubits: int = 4,
+        input_size: Optional[int] = None,
     ):
         super().__init__(
             num_classes,
@@ -113,6 +139,7 @@ class BatchedHybridQuantumMultiClassCNN(HybridQuantumMultiClassCNN):
             measurement,
             trainable_quantum,
             n_qubits,
+            input_size,
         )
 
         # Replace the qconv layer with the batched version
@@ -134,16 +161,17 @@ class BatchedGPUHybridQuantumMultiClassCNN(HybridQuantumMultiClassCNN):
 
     def __init__(
         self,
-        num_classes,
-        kernel_size=2,
-        stride=2,
-        pool_size=8,
-        hidden_size=64,
-        encoding="ry",
-        ansatz=None,
-        measurement="z",
-        trainable_quantum=True,
-        n_qubits=4,
+        num_classes: int,
+        kernel_size: int = 2,
+        stride: int = 2,
+        pool_size: Optional[int] = None,
+        hidden_size: Union[int, List[int]] = 64,
+        encoding: str = "ry",
+        ansatz: Optional[QCNNAnsatz] = None,
+        measurement: str = "z",
+        trainable_quantum: bool = True,
+        n_qubits: int = 4,
+        input_size: Optional[int] = None,
     ):
         super().__init__(
             num_classes,
@@ -156,6 +184,7 @@ class BatchedGPUHybridQuantumMultiClassCNN(HybridQuantumMultiClassCNN):
             measurement,
             trainable_quantum,
             n_qubits,
+            input_size,
         )
 
         # Replace the qconv layer with the batched GPU version

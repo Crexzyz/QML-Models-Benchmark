@@ -30,7 +30,7 @@ class MultiClassTrainer:
         self.log_interval = log_interval
 
     def train(
-        self, model, train_loader, optimizer, epochs, test_loader=None
+        self, model, train_loader, optimizer, epochs, test_loader=None, scheduler=None
     ) -> dict[str, list]:
         """
         Train the model.
@@ -40,7 +40,9 @@ class MultiClassTrainer:
             train_loader: DataLoader for training data
             optimizer: Optimizer
             epochs: Number of training epochs
-            test_loader: Optional DataLoader for test data. If provided, evaluation runs after each epoch.
+            test_loader: Optional DataLoader for test data. If provided, evaluation
+            runs after each epoch.
+            scheduler: Optional learning rate scheduler.
 
         Returns:
             dict with keys:
@@ -65,9 +67,12 @@ class MultiClassTrainer:
 
             for batch_idx, (images, labels) in enumerate(loop):
                 images = images.to(self.device)
-                labels = labels.to(
-                    self.device
-                ).long()  # ensure long for CrossEntropyLoss
+
+                # Check for float inputs => multi-label/BCE, else long for C-Entropy
+                if isinstance(self.criterion, torch.nn.BCEWithLogitsLoss):
+                    labels = labels.to(self.device).float()
+                else:
+                    labels = labels.to(self.device).long()
 
                 optimizer.zero_grad()
                 outputs = model(images)
@@ -75,7 +80,8 @@ class MultiClassTrainer:
                 loss.backward()
 
                 if self.max_grad_norm is not None:
-                    # Gradient clipping for stability (helps with noisy quantum gradients)
+                    # Gradient clipping for stability (helps with noisy quantum
+                    # gradients)
                     torch.nn.utils.clip_grad_norm_(
                         model.parameters(), self.max_grad_norm
                     )
@@ -85,8 +91,18 @@ class MultiClassTrainer:
                 running_loss += loss.item() * images.size(0)
 
                 with torch.no_grad():
-                    preds = torch.argmax(outputs, dim=1)  # get class with highest logit
-                    correct += (preds == labels).sum().item()
+                    if isinstance(self.criterion, torch.nn.BCEWithLogitsLoss):
+                        # Multi-label accuracy (Subset Accuracy aka Exact Match)
+                        # Preds > 0 (since logits) means prob > 0.5
+                        preds = (outputs > 0).float()
+                        # correct if all classes match exactly
+                        matches = (preds == labels).all(dim=1).float()
+                        correct += matches.sum().item()
+                    else:
+                        # Single-label multiclass
+                        preds = torch.argmax(outputs, dim=1)
+                        correct += (preds == labels).sum().item()
+
                     total += labels.size(0)
 
                 # Update progress bar
@@ -106,13 +122,26 @@ class MultiClassTrainer:
                 test_losses.append(test_loss)
                 test_accuracies.append(test_acc)
                 print(
-                    f"Epoch {epoch}: Train Loss={epoch_train_loss:.4f}, Train Acc={epoch_train_acc:.4f} | "
+                    f"Epoch {epoch}: Train Loss={epoch_train_loss:.4f}, "
+                    f"Train Acc={epoch_train_acc:.4f} | "
                     f"Test Loss={test_loss:.4f}, Test Acc={test_acc:.4f}"
                 )
             else:
                 print(
-                    f"Epoch {epoch}: Loss={epoch_train_loss:.4f}, Acc={epoch_train_acc:.4f}"
+                    f"Epoch {epoch}: Loss={epoch_train_loss:.4f}, "
+                    f"Acc={epoch_train_acc:.4f}"
                 )
+
+            # Step the scheduler if provided
+            if scheduler is not None:
+                # If scheduler is ReduceLROnPlateau, pass validation loss
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    if test_loader is not None:
+                        scheduler.step(test_loss)
+                    else:
+                        scheduler.step(epoch_train_loss)
+                else:
+                    scheduler.step()
 
         # Return results
         result = {
@@ -154,35 +183,53 @@ class MultiClassTrainer:
         with torch.no_grad():
             for images, labels in tqdm(test_loader, desc="Evaluating"):
                 images = images.to(self.device)
-                labels = labels.to(self.device).long()
+
+                # Check for float inputs => multi-label/BCE
+                is_multilabel = isinstance(self.criterion, torch.nn.BCEWithLogitsLoss)
+
+                if is_multilabel:
+                    labels = labels.to(self.device).float()
+                else:
+                    labels = labels.to(self.device).long()
 
                 outputs = model(images)
                 loss = self.criterion(outputs, labels)
 
                 total_loss += loss.item() * images.size(0)
 
-                # Get predictions (class with highest logit)
-                preds = torch.argmax(outputs, dim=1)
+                if is_multilabel:
+                    preds = (outputs > 0).float()
+                    matches = (preds == labels).all(dim=1).float()
+                    correct += matches.sum().item()
+                    # Confusion matrix is tricky for multi-label, skipping or simple
+                    # flatten
+                    # Here we just store flattened vectors or skip
+                else:
+                    preds = torch.argmax(outputs, dim=1)
+                    correct += (preds == labels).sum().item()
+                    all_preds.extend(preds.cpu().numpy())
+                    all_labels.extend(labels.cpu().numpy())
 
-                correct += (preds == labels).sum().item()
                 total += labels.size(0)
-
-                # Store for confusion matrix
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
 
         # Calculate metrics
         avg_loss = total_loss / total
         accuracy = correct / total
 
-        # Build confusion matrix
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
+        # Build confusion matrix only for single-label
+        if len(all_labels) > 0 and not isinstance(
+            self.criterion, torch.nn.BCEWithLogitsLoss
+        ):
+            all_preds = np.array(all_preds)
+            all_labels = np.array(all_labels)
 
-        num_classes = int(max(all_labels.max(), all_preds.max()) + 1)
-        confusion_matrix = np.zeros((num_classes, num_classes), dtype=int)
+            num_classes = int(max(all_labels.max(), all_preds.max()) + 1)
+            confusion_matrix = np.zeros((num_classes, num_classes), dtype=int)
 
-        for true_label, pred_label in zip(all_labels, all_preds):
-            confusion_matrix[true_label, pred_label] += 1
+            for true_label, pred_label in zip(all_labels, all_preds):
+                confusion_matrix[true_label, pred_label] += 1
+        else:
+            # Placeholder for multi-label where simple CM doesn't apply
+            confusion_matrix = np.zeros((1, 1), dtype=int)
 
         return (avg_loss, accuracy), confusion_matrix
