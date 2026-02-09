@@ -92,18 +92,15 @@ class MultiClassTrainer:
 
                 with torch.no_grad():
                     if isinstance(self.criterion, torch.nn.BCEWithLogitsLoss):
-                        # Multi-label accuracy (Subset Accuracy aka Exact Match)
-                        # Preds > 0 (since logits) means prob > 0.5
+                        # Multi-label: per-label accuracy
                         preds = (outputs > 0).float()
-                        # correct if all classes match exactly
-                        matches = (preds == labels).all(dim=1).float()
-                        correct += matches.sum().item()
+                        correct += (preds == labels).sum().item()
+                        total += labels.numel()  # count all label entries
                     else:
                         # Single-label multiclass
                         preds = torch.argmax(outputs, dim=1)
                         correct += (preds == labels).sum().item()
-
-                    total += labels.size(0)
+                        total += labels.size(0)
 
                 # Update progress bar
                 if batch_idx % self.log_interval == 0:
@@ -199,18 +196,14 @@ class MultiClassTrainer:
 
                 if is_multilabel:
                     preds = (outputs > 0).float()
-                    matches = (preds == labels).all(dim=1).float()
-                    correct += matches.sum().item()
-                    # Confusion matrix is tricky for multi-label, skipping or simple
-                    # flatten
-                    # Here we just store flattened vectors or skip
+                    correct += (preds == labels).sum().item()
+                    total += labels.numel()  # count all label entries
                 else:
                     preds = torch.argmax(outputs, dim=1)
                     correct += (preds == labels).sum().item()
                     all_preds.extend(preds.cpu().numpy())
                     all_labels.extend(labels.cpu().numpy())
-
-                total += labels.size(0)
+                    total += labels.size(0)
 
         # Calculate metrics
         avg_loss = total_loss / total

@@ -30,7 +30,7 @@ class Trainer:
         self.log_interval = log_interval
 
     def train(
-        self, model, train_loader, optimizer, epochs, test_loader=None
+        self, model, train_loader, optimizer, epochs, test_loader=None, scheduler=None
     ) -> dict[str, list]:
         """
         Train the model.
@@ -40,7 +40,9 @@ class Trainer:
             train_loader: DataLoader for training data
             optimizer: Optimizer
             epochs: Number of training epochs
-            test_loader: Optional DataLoader for test data. If provided, evaluation runs after each epoch.
+            test_loader: Optional DataLoader for test data. If provided, evaluation
+            runs after each epoch.
+            scheduler: Optional learning rate scheduler.
 
         Returns:
             If test_loader is None:
@@ -68,9 +70,7 @@ class Trainer:
 
             for batch_idx, (images, labels) in enumerate(loop):
                 images = images.to(self.device)
-                labels = labels.to(
-                    self.device
-                ).float()  # ensure float for BCEWithLogitsLoss
+                labels = labels.to(self.device).float()
 
                 optimizer.zero_grad()
                 outputs = model(images)
@@ -78,7 +78,8 @@ class Trainer:
                 loss.backward()
 
                 if self.max_grad_norm is not None:
-                    # Gradient clipping for stability (helps with noisy quantum gradients)
+                    # Gradient clipping for stability (helps with noisy quantum
+                    # gradients)
                     torch.nn.utils.clip_grad_norm_(
                         model.parameters(), self.max_grad_norm
                     )
@@ -110,13 +111,26 @@ class Trainer:
                 test_losses.append(test_loss)
                 test_accuracies.append(test_acc)
                 print(
-                    f"Epoch {epoch}: Train Loss={epoch_train_loss:.4f}, Train Acc={epoch_train_acc:.4f} | "
+                    f"Epoch {epoch}: Train Loss={epoch_train_loss:.4f}, "
+                    f"Train Acc={epoch_train_acc:.4f} | "
                     f"Test Loss={test_loss:.4f}, Test Acc={test_acc:.4f}"
                 )
             else:
                 print(
-                    f"Epoch {epoch}: Loss={epoch_train_loss:.4f}, Acc={epoch_train_acc:.4f}"
+                    f"Epoch {epoch}: Loss={epoch_train_loss:.4f}, "
+                    f"Acc={epoch_train_acc:.4f}"
                 )
+
+            # Step the scheduler if provided
+            if scheduler is not None:
+                # If scheduler is ReduceLROnPlateau, pass validation loss
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    if test_loader is not None:
+                        scheduler.step(test_loss)
+                    else:
+                        scheduler.step(epoch_train_loss)
+                else:
+                    scheduler.step()
 
         # Return results based on whether test_loader was provided
         if test_loader is not None:
@@ -167,7 +181,7 @@ class Trainer:
 
                 total_loss += loss.item() * images.size(0)
 
-                # Get predictions
+                # Get predictions for binary classification
                 probs = torch.sigmoid(outputs)
                 preds = (probs > 0.5).long()
 
