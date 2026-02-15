@@ -202,8 +202,10 @@ __marimo__/
 # Data files
 **/data/
 
+# Training outputs
 *.jpg
 *.json
+runs/
 
 # For jupyter settings
 !.vscode/settings.json
