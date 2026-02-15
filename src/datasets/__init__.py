@@ -2,6 +2,6 @@
 Data utilities and dataset classes.
 """
 
-from .junk_food import JunkFoodDataset
+from .junk_food import JunkFoodBinaryDataset, JunkFoodMulticlassDataset
 
-__all__ = ["JunkFoodDataset"]
+__all__ = ["JunkFoodBinaryDataset", "JunkFoodMulticlassDataset"]
