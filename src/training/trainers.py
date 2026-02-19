@@ -28,16 +28,16 @@ class MultiClassTrainer(BaseTrainer):
 class MultiLabelTrainer(BaseTrainer):
     """Trainer for multi-label classification using BCEWithLogitsLoss.
 
-    Accuracy is computed *per label* (i.e. each label slot counts as one
-    prediction) which matches the notebook implementation.
+    Accuracy is computed as *subset accuracy* (exact match ratio).
+    Every label for a sample must be correct for it to count.
     """
 
     def _evaluate_batch(self, outputs, labels) -> tuple[torch.Tensor, int, int]:
         # Multi-label: threshold at 0 (logits)
         preds = (outputs > 0).float()
-        # Per-label accuracy: count every matching label entry
-        batch_correct = (preds == labels).sum().item()
-        batch_total = labels.numel()
+        # Subset accuracy: for each sample, ALL labels must match
+        batch_correct = (preds == labels).all(dim=1).sum().item()
+        batch_total = labels.size(0)
         return preds, batch_correct, batch_total
 
     def evaluate(self, model, test_loader):
