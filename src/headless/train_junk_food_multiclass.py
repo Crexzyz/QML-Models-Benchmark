@@ -36,15 +36,15 @@ CONFIG = {
     # Data
     "train_data": "src/data/data_aug",
     "test_data": "src/data/data_noaug",
-    "image_size": 128,
+    "image_size": 640,
     # Model
     "kernel_size": 3,
-    "stride": 1,
-    "pool_size": 12,
+    "stride": 2,
+    "pool_size": 32,
     "encoding": "dense",
     "n_qubits": 4,
     "measurement": "x",
-    "hidden_size": [128, 64, 32],
+    "hidden_size": [512, 256, 128],
     # Training
     "epochs": 15,
     "batch_size": 32,

@@ -50,6 +50,10 @@ class HybridQuantumCNN(nn.Module):
         """
         super().__init__()
 
+        # Lightweight 1x1 convolution to learn optimal RGB mixing
+        # Adds only 4 parameters but fixes the channel averaging data loss
+        self.rgb_reduction = nn.Conv2d(3, 1, kernel_size=1)
+
         if pool_size is None:
             if input_size is not None:
                 # Calculate output dimension of convolution to preserve all features
@@ -96,6 +100,9 @@ class HybridQuantumCNN(nn.Module):
         self.classical = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Learnable RGB reduction to 1 channel (preserves info better than mean)
+        x = self.rgb_reduction(x)
+
         # Apply quantum convolution (acts like Conv2D with quantum kernel)
         x = self.qconv(x)
 
