@@ -53,13 +53,21 @@ class HybridQuantumMultiClassCNN(nn.Module):
 
         self.num_classes = num_classes
 
-        # Lightweight 1x1 convolution to learn optimal RGB mixing
-        # Adds only 4 parameters but fixes the channel averaging data loss
-        self.rgb_reduction = nn.Conv2d(3, 1, kernel_size=1)
+        # 1. Classical Downsampling (process ALL pixels, output 16 channels)
+        self.pre_conv = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=4, stride=4, padding=0),
+            nn.ReLU(),
+            nn.BatchNorm2d(16)
+        )
+
+        # 2. Reduction to 1 channel for Quantum Layer
+        self.rgb_reduction = nn.Conv2d(16, 1, kernel_size=1)
 
         if pool_size is None:
+            # Recalculate input size after stride 4 downsampling
             if input_size is not None:
-                pool_size = (input_size - kernel_size) // stride + 1
+                feat_map_size = input_size // 4
+                pool_size = (feat_map_size - kernel_size) // stride + 1
             else:
                 pool_size = 8
 
@@ -101,10 +109,12 @@ class HybridQuantumMultiClassCNN(nn.Module):
         self.classical = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Learnable RGB reduction to 1 channel (preserves info better than mean)
+        x = self.pre_conv(x)
+
+        # Reduce 16 channels -> 1 channel (learnable)
         x = self.rgb_reduction(x)
 
-        # Apply quantum convolution (acts like Conv2D with quantum kernel)
+        # Apply quantum convolution on the compressed features
         x = self.qconv(x)
 
         # Adaptive pooling to handle any size
