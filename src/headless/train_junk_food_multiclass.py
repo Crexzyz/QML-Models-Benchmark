@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 
 from ..datasets import JunkFoodMulticlassDataset
-from ..qml.models.multiclass import BatchedGPUHybridQuantumMultiClassCNN
+from ..qml.models.multilabel import BatchedGPUHybridQuantumMultiLabelCNN
 from ..qml.ansatz.dense import DenseQCNNAnsatz4
 from ..training.trainers import MultiLabelTrainer
 
@@ -39,8 +39,8 @@ CONFIG = {
     "image_size": 640,
     # Model
     "kernel_size": 3,
-    "stride": 2,
-    "pool_size": 32,
+    "stride": 1,
+    "pool_size": 18,
     "encoding": "dense",
     "n_qubits": 4,
     "measurement": "x",
@@ -48,7 +48,7 @@ CONFIG = {
     # Training
     "epochs": 15,
     "batch_size": 32,
-    "lr": 0.005,
+    "lr": 0.0001,
     "weight_decay": 1e-4,
     "max_grad_norm": 1.0,
     "seed": 42,
@@ -130,12 +130,13 @@ def load_data(config):
 
 def build_model(config, num_classes, device):
     """Construct the quantum CNN model for multiclass classification."""
-    model = BatchedGPUHybridQuantumMultiClassCNN(
+    model = BatchedGPUHybridQuantumMultiLabelCNN(
         num_classes=num_classes,
         input_size=config["image_size"],
         kernel_size=config["kernel_size"],
         stride=config["stride"],
-        pool_size=config["pool_size"],
+        # pool_size is now ignored by MultiLabel model (fixed to 4x4)
+        pool_size=config.get("pool_size", 4),
         encoding=config["encoding"],
         ansatz=DenseQCNNAnsatz4(),
         n_qubits=config["n_qubits"],
