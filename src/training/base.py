@@ -22,6 +22,7 @@ class BaseTrainer(ABC):
 
     _CSV_FIELDS = [
         "epoch", "train_loss", "train_acc", "test_loss", "test_acc",
+        "precision", "recall", "f1", "micro_f1", "macro_f1",
         "epoch_time_s", "lr",
     ]
 
@@ -92,11 +93,11 @@ class BaseTrainer(ABC):
 
     def _init_csv(self) -> None:
         with open(self._metrics_path, "w", newline="") as f:
-            csv.DictWriter(f, fieldnames=self._CSV_FIELDS).writeheader()
+            csv.DictWriter(f, fieldnames=self._CSV_FIELDS, restval="").writeheader()
 
     def _log_csv(self, row: dict) -> None:
         with open(self._metrics_path, "a", newline="") as f:
-            csv.DictWriter(f, fieldnames=self._CSV_FIELDS).writerow(row)
+            csv.DictWriter(f, fieldnames=self._CSV_FIELDS, restval="").writerow(row)
 
     def _save_checkpoint(
         self, epoch, model, optimizer, metrics, filename=None,
@@ -212,15 +213,29 @@ class BaseTrainer(ABC):
 
             # Run evaluation if test_loader provided
             test_loss = test_acc = None
+            test_metrics: dict = {}
             if test_loader is not None:
-                (test_loss, test_acc), _ = self.evaluate(model, test_loader)
+                test_metrics, _ = self.evaluate(model, test_loader)
+                test_loss = test_metrics["loss"]
+                test_acc = test_metrics["acc"]
                 test_losses.append(test_loss)
                 test_accuracies.append(test_acc)
+                extra = ""
+                if "f1" in test_metrics:
+                    extra = f", F1={test_metrics['f1']:.4f}"
+                elif "micro_f1" in test_metrics:
+                    extra = (
+                        f", MicroF1={test_metrics['micro_f1']:.4f}"
+                        f", MacroF1={test_metrics['macro_f1']:.4f}"
+                    )
                 self._report_epoch(
                     f"Epoch {epoch}: Train Loss={epoch_train_loss:.4f}, "
                     f"Train Acc={epoch_train_acc:.4f} | "
-                    f"Test Loss={test_loss:.4f}, Test Acc={test_acc:.4f}"
+                    f"Test Loss={test_loss:.4f}, Test Acc={test_acc:.4f}{extra}"
                 )
+                if "per_class_f1" in test_metrics:
+                    per_class = [f'{v:.4f}' for v in test_metrics['per_class_f1']]
+                    self._report_epoch(f"  Per-class F1: {per_class}")
             else:
                 self._report_epoch(
                     f"Epoch {epoch}: Loss={epoch_train_loss:.4f}, "
@@ -257,6 +272,9 @@ class BaseTrainer(ABC):
                     "epoch_time_s": f"{epoch_time:.1f}",
                     "lr": f"{current_lr:.6f}",
                 }
+                for field in ("precision", "recall", "f1", "micro_f1", "macro_f1"):
+                    if field in test_metrics:
+                        csv_row[field] = f"{test_metrics[field]:.6f}"
                 self._log_csv(csv_row)
 
                 if self.save_every > 0 and epoch % self.save_every == 0:
@@ -369,4 +387,4 @@ class BaseTrainer(ABC):
 
         confusion_matrix = np.array([[tn, fp], [fn, tp]])
 
-        return (avg_loss, accuracy), confusion_matrix
+        return {"loss": avg_loss, "acc": accuracy}, confusion_matrix
