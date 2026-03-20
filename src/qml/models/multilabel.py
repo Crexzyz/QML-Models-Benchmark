@@ -1,5 +1,5 @@
 """
-Multiclass classification model with quantum convolutional layers.
+Multi-label classification model with quantum convolutional layers.
 """
 
 from typing import List, Optional, Union
@@ -53,28 +53,20 @@ class HybridQuantumMultiLabelCNN(nn.Module):
 
         self.num_classes = num_classes
 
-        # 1. Use Pre-trained ResNet18 as Feature Extractor (Transfer Learning)
-        import torchvision.models as models
-        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        # 1. Lightweight feature extractor (no pre-trained weights)
+        # Conv2d(3->16, k=7, s=4, p=3): 640x640 -> 160x160
+        # AvgPool2d(k=8, s=8):           160x160 -> 20x20
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=7, stride=4, padding=3, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d(kernel_size=8, stride=8),
+        )
 
-        # Remove the final classification layer (fc) and average pooling layer
-        # Keep layers up to layer4 to get spatial features (512 channels)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        # 2. Reduction: 16 channels -> 1 channel for Quantum Layer
+        self.rgb_reduction = nn.Conv2d(16, 1, kernel_size=1)
 
-        # Freeze backbone to avoid destroying pre-trained features during initial
-        # training
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-
-        # 2. Reduction: 512 ResNet channels -> 1 channel for Quantum Layer
-        self.rgb_reduction = nn.Conv2d(512, 1, kernel_size=1)
-
-        # 3. Fixed size pooling since ResNet output is consistent
-        # For ResNet18:
-        # Input 640x640 -> 20x20
-        # Input 256x256 -> 8x8
-        # We pool to 4x4 regardless of input size to keep FC layer consistent
-        # and act as spatial pyramid pooling
+        # 3. Fixed 4x4 pooling to keep FC layer size consistent
         fixed_pool_dim = 4
         self.adaptive_pool = nn.AdaptiveAvgPool2d((fixed_pool_dim, fixed_pool_dim))
 
@@ -112,11 +104,10 @@ class HybridQuantumMultiLabelCNN(nn.Module):
         self.classical = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Pre-process: 640x640 -> 20x20 semantic map (with 512 channels)
-        # Using pre-trained ResNet backbone
+        # Feature extraction: 640x640 -> 20x20 (16 channels)
         x = self.backbone(x)
 
-        # Reduce 512 channels -> 1 channel (learnable mix)
+        # Reduce 16 channels -> 1 channel (learnable mix)
         x = self.rgb_reduction(x)
 
         # Apply quantum convolution (acts like Conv2D with quantum kernel)

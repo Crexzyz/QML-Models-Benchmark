@@ -40,7 +40,6 @@ CONFIG = {
     # Model
     "kernel_size": 3,
     "stride": 1,
-    "pool_size": 18,
     "encoding": "dense",
     "n_qubits": 4,
     "measurement": "x",
@@ -135,30 +134,12 @@ def build_model(config, num_classes, device):
         input_size=config["image_size"],
         kernel_size=config["kernel_size"],
         stride=config["stride"],
-        # pool_size is now ignored by MultiLabel model (fixed to 4x4)
-        pool_size=config.get("pool_size", 4),
         encoding=config["encoding"],
         ansatz=DenseQCNNAnsatz4(),
         n_qubits=config["n_qubits"],
         measurement=config["measurement"],
         hidden_size=config["hidden_size"],
     )
-
-    print("Swapping ResNet backbone for Lightweight Convolution + Pooling...")
-
-    # Single Convolutional Layer (Learnable)
-    # Reduces 640x640 -> 160x160 (Stride 4)
-    # Followed by AvgPool to reach 20x20 target (Factor of 8)
-    model.backbone = nn.Sequential(
-        nn.Conv2d(3, 16, kernel_size=7, stride=4, padding=3, bias=False),
-        nn.BatchNorm2d(16),
-        nn.ReLU(inplace=True),
-        nn.AvgPool2d(kernel_size=8, stride=8)
-    )
-
-    # Update rgb_reduction to take 16 channels (from our Conv layer)
-    model.rgb_reduction = nn.Conv2d(16, 1, kernel_size=1)
-
     return model.to(device)
 
 
