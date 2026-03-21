@@ -45,10 +45,10 @@ CONFIG = {
     "measurement": "x",
     "hidden_size": [512, 256, 128],
     # Training
-    "epochs": 15,
+    "epochs": 1800,
     "batch_size": 32,
     "lr": 0.0001,
-    "weight_decay": 1e-4,
+    "weight_decay": 1e-5,
     "max_grad_norm": 1.0,
     "seed": 42,
     # Output

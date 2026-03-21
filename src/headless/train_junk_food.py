@@ -47,10 +47,10 @@ CONFIG = {
     "measurement": "x",
     "hidden_size": [128, 64, 32],  # Pyramid: 144->128->64->32->1
     # Training
-    "epochs": 15,
-    "batch_size": 8,
-    "lr": 0.003,
-    "weight_decay": 1e-4,
+    "epochs": 30,
+    "batch_size": 20,
+    "lr": 0.005,
+    "weight_decay": 1e-5,
     "max_grad_norm": 1.0,
     "seed": 42,
     # Output
