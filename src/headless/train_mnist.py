@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import StepLR
 from torchvision import datasets, transforms
 
-from ..qml.models.multiclass import BatchedGPUHybridQuantumMultiClassCNN
+from ..qml.models.multiclass import HybridQuantumMultiClassCNN
 from ..qml.ansatz.dense import DenseQCNNAnsatz4
 from ..training.trainers import MultiClassTrainer
 
@@ -137,7 +137,7 @@ def load_data(config):
 def build_model(config, device):
     """Construct the quantum CNN model, selecting GPU-batched variant if CUDA."""
 
-    model = BatchedGPUHybridQuantumMultiClassCNN(
+    model = HybridQuantumMultiClassCNN(
         input_size=config["image_size"],
         num_classes=config["num_classes"],
         kernel_size=config["kernel_size"],

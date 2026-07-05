@@ -11,14 +11,11 @@ from .ansatz.standard import StandardQCNNAnsatz
 from .encoders import QuantumEncoder
 
 
-class QuantumConv2D(nn.Module):
+class BatchedQuantumConv2D(nn.Module):
     """
-    Quantum convolutional layer that applies QCNN as a sliding kernel over image
-    patches.
-    Similar to classical Conv2D but using quantum circuits.
-
-    This is the reference sequential implementation. For performance,
-    use BatchedQuantumConv2D.
+    Quantum convolutional layer using vectorized patch execution.
+    Applies QCNN as a sliding kernel over image patches,
+    similar to classical Conv2D but using quantum circuits.
     """
 
     def __init__(
@@ -30,16 +27,18 @@ class QuantumConv2D(nn.Module):
         encoding="ry",
         ansatz=None,
         measurement="z",
+        use_gpu=False,
     ):
         """
         Args:
             kernel_size: Size of the convolutional kernel
             stride: Stride for the convolution
             n_qubits: Number of qubits in the quantum circuit
-            device_type: PennyLane device type
+            device_type: PennyLane device type (ignored if use_gpu=True)
             encoding: Encoding strategy - 'rx', 'ry', 'rz', or 'dense'
             ansatz: QCNNAnsatz instance (defaults to StandardQCNNAnsatz)
             measurement: Measurement axis - 'x', 'y', or 'z' (default: 'z')
+            use_gpu: If True, use default.qubit with backprop for GPU support
         """
         super().__init__()
         self.kernel_size = kernel_size
@@ -49,6 +48,7 @@ class QuantumConv2D(nn.Module):
         self.ansatz = (
             ansatz if ansatz is not None else StandardQCNNAnsatz(rotation_gate="ry")
         )
+        self.use_gpu = use_gpu
 
         # Validate and set measurement observable
         valid_measurements = ["x", "y", "z"]
@@ -68,20 +68,27 @@ class QuantumConv2D(nn.Module):
                 f"encoding must be one of {valid_encodings}, got '{encoding}'"
             )
 
-        # Try to use Lightning simulator for speed
+        # Override device if GPU mode is enabled
+        if use_gpu:
+            device_type = "default.qubit"
+
+        # Try to use selected device (or fall back to default.qubit)
         try:
             self.dev = qml.device(device_type, wires=n_qubits)
+            diff_method = "backprop" if use_gpu else None
+            device_label = f"{device_type} (GPU mode)" if use_gpu else device_type
             print(
-                f"Using {device_type} device with '{encoding}' encoding, "
+                f"Using {device_label} device with '{encoding}' encoding, "
                 f"{type(self.ansatz).__name__}, measurement=Pauli{measurement.upper()}"
             )
         except Exception as e:
             print(
-                f"Lightning device not available ({e}), falling back to default.qubit"
+                f"Device '{device_type}' not available ({e}), falling back to default.qubit"
             )
             self.dev = qml.device("default.qubit", wires=n_qubits)
+            diff_method = "backprop" if use_gpu else None
             print(
-                f"Using '{encoding}' encoding, {type(self.ansatz).__name__}, "
+                f"Using default.qubit with '{encoding}' encoding, {type(self.ansatz).__name__}, "
                 f"measurement=Pauli{measurement.upper()}"
             )
 
@@ -89,6 +96,19 @@ class QuantumConv2D(nn.Module):
         self.q_params = nn.Parameter(
             torch.randn(self.ansatz.n_layers, self.ansatz.n_params_per_layer) * 0.1
         )
+
+        # Define the QNode for batched execution
+        qnode_kwargs = {"interface": "torch"}
+        if diff_method:
+            qnode_kwargs["diff_method"] = diff_method
+
+        @qml.qnode(self.dev, **qnode_kwargs)
+        def circuit(inputs, weights):
+            self.encode_data(inputs)
+            self.ansatz(weights)
+            return qml.expval(self._observable_fn(self.n_qubits - 1))
+
+        self.circuit_runner = circuit
 
     def encode_data(self, inputs):
         """
@@ -118,17 +138,6 @@ class QuantumConv2D(nn.Module):
             for i in range(self.n_qubits):
                 values = inputs[i * 3 : (i + 1) * 3]
                 QuantumEncoder.dense_encoding(values, wire=i)
-
-    def qcnn_circuit(self, inputs, weights):
-        """Quantum circuit for processing one patch."""
-        # Encode patch into quantum state using selected encoding
-        self.encode_data(inputs)
-
-        # Apply the full QCNN ansatz (conv + pooling handled by the injected module)
-        self.ansatz(weights)
-
-        # Measurement on the final qubit using configured observable
-        return qml.expval(self._observable_fn(self.n_qubits - 1))
 
     def extract_patches(self, x):
         """
@@ -167,99 +176,6 @@ class QuantumConv2D(nn.Module):
 
         patches = torch.stack(patches, dim=1)
         return patches, out_h, out_w
-
-    def forward(self, x):
-        """
-        Apply quantum kernel as a sliding window over the image.
-        Sequential execution (slow).
-
-        Args:
-            x: Tensor of shape (batch_size, channels, height, width)
-
-        Returns:
-            Tensor of shape (batch_size, 1, out_height, out_width)
-        """
-        batch_size, channels, height, width = x.shape
-
-        # Extract patches
-        patches, out_h, out_w = self.extract_patches(x)
-        # patches shape: (batch_size, out_h, out_w, patch_features)
-
-        # Calculate required input size based on encoding
-        if self.encoding == "dense":
-            required_inputs = self.n_qubits * 3
-        else:  # 'rx', 'ry', or 'rz'
-            required_inputs = self.n_qubits
-
-        # Process each patch through quantum circuit
-        feature_maps = []
-        for b in range(batch_size):
-            batch_features = []
-            for i in range(out_h):
-                for j in range(out_w):
-                    # Get patch
-                    patch = patches[b, i, j]
-
-                    # Reduce to required dimensions
-                    if patch.shape[0] > required_inputs:
-                        # Average pooling to reduce dimensions
-                        patch_size = patch.shape[0] // required_inputs
-                        patch_reduced = torch.stack(
-                            [
-                                patch[k * patch_size : (k + 1) * patch_size].mean()
-                                for k in range(required_inputs)
-                            ]
-                        )
-                    else:
-                        # Pad if needed
-                        patch_reduced = torch.cat(
-                            [
-                                patch,
-                                torch.zeros(
-                                    required_inputs - patch.shape[0],
-                                    device=patch.device,
-                                ),
-                            ]
-                        )[:required_inputs]
-
-                    # Normalize to [-pi, pi] range
-                    patch_norm = torch.tanh(patch_reduced) * np.pi
-
-                    # Create QNode and execute
-                    qnode = qml.QNode(
-                        lambda weights: self.qcnn_circuit(patch_norm, weights),
-                        self.dev,
-                        interface="torch",
-                    )
-                    result = qnode(self.q_params)
-                    batch_features.append(result.float())
-
-            # Reshape to feature map
-            feature_map = torch.stack(batch_features).reshape(out_h, out_w)
-            feature_maps.append(feature_map)
-
-        # Stack all batches: (batch_size, out_h, out_w) -> (batch_size, 1, out_h, out_w)
-        output = torch.stack(feature_maps).unsqueeze(1)
-        return output
-
-
-class BatchedQuantumConv2D(QuantumConv2D):
-    """
-    Optimized Quantum Convolutional Layer using vectorized patch execution.
-    Much faster than QuantumConv2D for large batches or images.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # Define the QNode for batched execution
-        @qml.qnode(self.dev, interface="torch")
-        def circuit(inputs, weights):
-            self.encode_data(inputs)
-            self.ansatz(weights)
-            return qml.expval(self._observable_fn(self.n_qubits - 1))
-
-        self.circuit_runner = circuit
 
     def forward(self, x):
         """
@@ -324,42 +240,3 @@ class BatchedQuantumConv2D(QuantumConv2D):
         output = results.view(batch_size, 1, out_h, out_w).float()
 
         return output
-
-
-class BatchedGPUQuantumConv2D(BatchedQuantumConv2D):
-    """
-    Batched Quantum Conv2D specifically optimized for GPU execution.
-    Uses default.qubit with backprop to enable Torch-native GPU simulation.
-    Use this when lightning.gpu is not available but you want to run on GPU.
-    """
-
-    def __init__(
-        self,
-        kernel_size=2,
-        stride=2,
-        n_qubits=4,
-        encoding="ry",
-        ansatz=None,
-        measurement="z",
-        **kwargs,
-    ):
-        # Force device_type to default.qubit which supports backprop on GPU
-        super().__init__(
-            kernel_size=kernel_size,
-            stride=stride,
-            n_qubits=n_qubits,
-            device_type="default.qubit",
-            encoding=encoding,
-            ansatz=ansatz,
-            measurement=measurement,
-            **kwargs,
-        )
-
-        # Re-define qnode with diff_method='backprop' to enable GPU support
-        @qml.qnode(self.dev, interface="torch", diff_method="backprop")
-        def circuit(inputs, weights):
-            self.encode_data(inputs)
-            self.ansatz(weights)
-            return qml.expval(self._observable_fn(self.n_qubits - 1))
-
-        self.circuit_runner = circuit

@@ -206,6 +206,7 @@ __marimo__/
 *.jpg
 *.json
 runs/
+visual/
 
 # For jupyter settings
 !.vscode/settings.json

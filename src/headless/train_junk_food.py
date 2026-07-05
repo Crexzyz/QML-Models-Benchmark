@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 
 from ..datasets import JunkFoodBinaryDataset
-from ..qml.models.binary import BatchedGPUHybridQuantumCNN
+from ..qml.models.binary import HybridQuantumCNN
 from ..qml.ansatz.dense import DenseQCNNAnsatz4
 from ..training.trainers import BinaryTrainer
 
@@ -119,7 +119,7 @@ def load_data(config):
 
 def build_model(config, device):
     """Construct the quantum CNN model."""
-    model = BatchedGPUHybridQuantumCNN(
+    model = HybridQuantumCNN(
         input_size=config["image_size"],
         kernel_size=config["kernel_size"],
         stride=config["stride"],
