@@ -83,12 +83,14 @@ class BatchedQuantumConv2D(nn.Module):
             )
         except Exception as e:
             print(
-                f"Device '{device_type}' not available ({e}), falling back to default.qubit"
+                f"Device '{device_type}' not available ({e}),"
+                f" falling back to default.qubit"
             )
             self.dev = qml.device("default.qubit", wires=n_qubits)
             diff_method = "backprop" if use_gpu else None
             print(
-                f"Using default.qubit with '{encoding}' encoding, {type(self.ansatz).__name__}, "
+                f"Using default.qubit with '{encoding}' encoding, "
+                f"{type(self.ansatz).__name__}, "
                 f"measurement=Pauli{measurement.upper()}"
             )
 

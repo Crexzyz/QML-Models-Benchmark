@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import StepLR
 from torchvision import datasets, transforms
 
-from ..qml.models.multiclass import HybridQuantumMultiClassCNN
+from ..qml.models.multiclass import MultiClassQCNN
 from ..qml.ansatz.dense import DenseQCNNAnsatz4
 from ..training.trainers import MultiClassTrainer
 
@@ -40,12 +40,8 @@ CONFIG = {
     "limit_samples": None,
     # Model
     "num_classes": 10,
-    "kernel_size": 3,
-    "stride": 1,
     "encoding": "dense",
-    "n_qubits": 4,
     "measurement": "z",
-    "hidden_size": [64, 32],
     # Training
     "epochs": 20,
     "batch_size": 32,
@@ -57,7 +53,7 @@ CONFIG = {
     "seed": 42,
     # Output
     "output_dir": "runs/mnist",
-    "log_interval": 200,
+    "log_interval": 2,
     "save_every": 1,
 }
 
@@ -101,8 +97,10 @@ def set_seed(seed):
 def load_data(config):
     """Load and prepare MNIST train/test datasets."""
     transform = transforms.Compose([
+        # MultiClassQCNN expects 3 input channels.
+        transforms.Grayscale(num_output_channels=3),
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),  # MNIST mean and std
+        transforms.Normalize((0.1307, 0.1307, 0.1307), (0.3081, 0.3081, 0.3081)),
     ])
 
     train_dataset_full = datasets.MNIST(
@@ -137,16 +135,13 @@ def load_data(config):
 def build_model(config, device):
     """Construct the quantum CNN model, selecting GPU-batched variant if CUDA."""
 
-    model = HybridQuantumMultiClassCNN(
-        input_size=config["image_size"],
+    model = MultiClassQCNN(
         num_classes=config["num_classes"],
-        kernel_size=config["kernel_size"],
-        stride=config["stride"],
+        input_size=config["image_size"],
         encoding=config["encoding"],
         ansatz=DenseQCNNAnsatz4(),
-        n_qubits=config["n_qubits"],
         measurement=config["measurement"],
-        hidden_size=config["hidden_size"],
+        use_gpu=(device.type == "cuda"),
     )
     return model.to(device)
 

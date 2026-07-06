@@ -12,6 +12,80 @@ from ..ansatz.base import QCNNAnsatz
 from ..layers import BatchedQuantumConv2D
 
 
+class MultiClassQCNN(nn.Module):
+    def __init__(
+        self,
+        num_classes: int,
+        input_size: int,
+        encoding: str = "ry",
+        ansatz: Optional[QCNNAnsatz] = None,
+        measurement: str = "z",
+        use_gpu: bool = False,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+
+        if input_size < 3:
+            raise ValueError("input_size must be >= 3 for two k=2, s=1 convolutions")
+
+        # Input image: (B, 3, N, N)
+        # For MNIST (N=28): 28x28 -> 27x27 after this layer.
+        self.downsample_conv = nn.Conv2d(3, 16, kernel_size=2, stride=1)
+
+        self.downsample_nonlinearity = nn.Sequential(
+            nn.ReLU(),
+            nn.BatchNorm2d(16)
+        )
+
+        # Quantum conv also uses k=2, s=1:
+        # (N-1)x(N-1) -> (N-2)x(N-2). For MNIST: 27x27 -> 26x26.
+        self.qconv = BatchedQuantumConv2D(
+            kernel_size=2,
+            stride=1,
+            n_qubits=4,
+            encoding=encoding,
+            ansatz=ansatz,
+            measurement=measurement,
+            use_gpu=use_gpu
+        )
+
+        qconv_out_size = input_size - 2
+        # Deterministic pooling target derived from input size.
+        # For MNIST: qconv_out_size=26 -> pool_size=6.
+        pool_size = max(1, qconv_out_size // 4)
+        self.qconv_adaptive_pool = nn.AdaptiveAvgPool2d((pool_size, pool_size))
+
+        min_width = max(2 * num_classes, 16)
+        depth = 4
+        pooled_feature_dim = pool_size * pool_size
+
+        layer_sizes = [
+            w for w in (pooled_feature_dim // (2 ** i) for i in range(1, depth + 1))
+            if w >= min_width
+        ]
+
+        flat_layers: List[nn.Module] = [nn.Flatten()]
+
+        loop_size = pooled_feature_dim
+        for size in layer_sizes:
+            flat_layers.append(nn.Linear(loop_size, size))
+            flat_layers.append(nn.ReLU())
+            flat_layers.append(nn.Dropout(0.2))
+            loop_size = size
+
+        flat_layers.append(nn.Linear(loop_size, num_classes))
+
+        self.hidden_layers = nn.Sequential(*flat_layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.downsample_conv(x)
+        x = self.downsample_nonlinearity(x)
+        x = self.qconv(x)
+        x = self.qconv_adaptive_pool(x)
+        x = self.hidden_layers(x)
+        return x
+
+
 class HybridQuantumMultiClassCNN(nn.Module):
     """
     Neural network with quantum convolutional kernels applied to image patches.
