@@ -25,11 +25,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchvision import datasets, transforms
 
 from ..qml.models.multiclass import MultiClassQCNN
-from ..qml.ansatz.dense import DenseQCNNAnsatz4
+from ..qml.ansatz.dense import DenseQCNNAnsatz4NoPool
 from ..training.trainers import MultiClassTrainer
 
 
@@ -47,9 +47,11 @@ CONFIG = {
     "batch_size": 32,
     "lr": 0.002,
     "weight_decay": 1e-5,
+    "label_smoothing": 0.05,
     "max_grad_norm": 1.0,
-    "scheduler_step_size": 5,
-    "scheduler_gamma": 0.5,
+    "scheduler_factor": 0.5,
+    "scheduler_patience": 2,
+    "scheduler_min_lr": 1e-5,
     "seed": 42,
     # Output
     "output_dir": "runs/mnist",
@@ -139,7 +141,8 @@ def build_model(config, device):
         num_classes=config["num_classes"],
         input_size=config["image_size"],
         encoding=config["encoding"],
-        ansatz=DenseQCNNAnsatz4(),
+        ansatz=DenseQCNNAnsatz4NoPool(),
+        readout_wires=[0, 1, 2, 3],
         measurement=config["measurement"],
         use_gpu=(device.type == "cuda"),
     )
@@ -177,16 +180,18 @@ def main():
     model = build_model(config, device)
 
     # Optimizer & loss
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(
+    criterion = nn.CrossEntropyLoss(label_smoothing=config["label_smoothing"])
+    optimizer = optim.AdamW(
         model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
     )
 
-    # Learning rate scheduler: reduce LR by gamma every step_size epochs
-    scheduler = StepLR(
+    # Learning rate scheduler: reduce LR when validation/test loss plateaus.
+    scheduler = ReduceLROnPlateau(
         optimizer,
-        step_size=config["scheduler_step_size"],
-        gamma=config["scheduler_gamma"],
+        mode="min",
+        factor=config["scheduler_factor"],
+        patience=config["scheduler_patience"],
+        min_lr=config["scheduler_min_lr"],
     )
 
     # Logger + trainer

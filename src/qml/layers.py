@@ -4,6 +4,7 @@ Quantum convolutional layers for hybrid quantum-classical neural networks.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pennylane as qml
 import numpy as np
 
@@ -28,6 +29,7 @@ class BatchedQuantumConv2D(nn.Module):
         ansatz=None,
         measurement="z",
         use_gpu=False,
+        readout_wires=None,
     ):
         """
         Args:
@@ -39,6 +41,12 @@ class BatchedQuantumConv2D(nn.Module):
             ansatz: QCNNAnsatz instance (defaults to StandardQCNNAnsatz)
             measurement: Measurement axis - 'x', 'y', or 'z' (default: 'z')
             use_gpu: If True, use default.qubit with backprop for GPU support
+            readout_wires: Wire(s) to measure, controlling the number of output
+                channels. Accepts an int (single wire), an iterable of wire
+                indices, or None. When None (default) only the last qubit
+                (``n_qubits - 1``) is measured, preserving single-channel
+                behaviour for pooling ansätze. Pass e.g. ``[0, 1, 2, 3]`` with a
+                non-pooling ansatz to emit one channel per qubit.
         """
         super().__init__()
         self.kernel_size = kernel_size
@@ -49,6 +57,23 @@ class BatchedQuantumConv2D(nn.Module):
             ansatz if ansatz is not None else StandardQCNNAnsatz(rotation_gate="ry")
         )
         self.use_gpu = use_gpu
+
+        # Resolve and validate the readout wires (define output channel count).
+        if readout_wires is None:
+            readout_wires = [n_qubits - 1]
+        elif isinstance(readout_wires, int):
+            readout_wires = [readout_wires]
+        else:
+            readout_wires = list(readout_wires)
+        if len(readout_wires) == 0:
+            raise ValueError("readout_wires must select at least one wire")
+        for w in readout_wires:
+            if not (0 <= w < n_qubits):
+                raise ValueError(
+                    f"readout wire {w} out of range for {n_qubits} qubits"
+                )
+        self.readout_wires = readout_wires
+        self.n_channels = len(readout_wires)
 
         # Validate and set measurement observable
         valid_measurements = ["x", "y", "z"]
@@ -99,6 +124,12 @@ class BatchedQuantumConv2D(nn.Module):
             torch.randn(self.ansatz.n_layers, self.ansatz.n_params_per_layer) * 0.1
         )
 
+        # Learnable input scale applied before the tanh squashing. Starting below
+        # 1.0 keeps tanh in its near-linear region initially, avoiding saturated
+        # (vanishing) gradients on the data-encoding rotations. The network can
+        # grow this if sharper encoding is beneficial.
+        self.input_scale = nn.Parameter(torch.tensor(0.5))
+
         # Define the QNode for batched execution
         qnode_kwargs = {"interface": "torch"}
         if diff_method:
@@ -108,7 +139,9 @@ class BatchedQuantumConv2D(nn.Module):
         def circuit(inputs, weights):
             self.encode_data(inputs)
             self.ansatz(weights)
-            return qml.expval(self._observable_fn(self.n_qubits - 1))
+            return [
+                qml.expval(self._observable_fn(w)) for w in self.readout_wires
+            ]
 
         self.circuit_runner = circuit
 
@@ -158,25 +191,13 @@ class BatchedQuantumConv2D(nn.Module):
         out_h = (height - self.kernel_size) // self.stride + 1
         out_w = (width - self.kernel_size) // self.stride + 1
 
-        patches = []
-        for i in range(out_h):
-            row_patches = []
-            for j in range(out_w):
-                # Extract patch
-                h_start = i * self.stride
-                w_start = j * self.stride
-                patch = x[
-                    :,
-                    :,
-                    h_start : h_start + self.kernel_size,
-                    w_start : w_start + self.kernel_size,
-                ]
-
-                patch_flat = patch.flatten(start_dim=1)
-                row_patches.append(patch_flat)
-            patches.append(torch.stack(row_patches, dim=1))
-
-        patches = torch.stack(patches, dim=1)
+        # Vectorized patch extraction via unfold (im2col).
+        # unfold -> (batch_size, channels * k * k, out_h * out_w)
+        patches = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride)
+        # -> (batch_size, out_h * out_w, channels * k * k)
+        patches = patches.transpose(1, 2)
+        # -> (batch_size, out_h, out_w, channels * k * k)
+        patches = patches.reshape(batch_size, out_h, out_w, -1)
         return patches, out_h, out_w
 
     def forward(self, x):
@@ -188,7 +209,8 @@ class BatchedQuantumConv2D(nn.Module):
             x: Tensor of shape (batch_size, channels, height, width)
 
         Returns:
-            Tensor of shape (batch_size, 1, out_height, out_width)
+            Tensor of shape (batch_size, n_channels, out_height, out_width),
+            where n_channels == len(readout_wires).
         """
         batch_size, channels, height, width = x.shape
 
@@ -198,7 +220,7 @@ class BatchedQuantumConv2D(nn.Module):
 
         # Flatten for batch processing: (Total_Patches, Features)
         total_patches = batch_size * out_h * out_w
-        patches_flat = patches.view(total_patches, -1)
+        patches_flat = patches.reshape(total_patches, -1)
 
         # Calculate required input size based on encoding
         if self.encoding == "dense":
@@ -226,8 +248,12 @@ class BatchedQuantumConv2D(nn.Module):
             )
             inputs_reduced = torch.cat([patches_flat, padding], dim=1)
 
-        # Normalize to [-pi, pi] range
-        inputs_norm = torch.tanh(inputs_reduced) * np.pi
+        # Squash to a safe rotation range. A learnable pre-tanh scale keeps the
+        # activation in its near-linear region at init (avoiding saturated,
+        # vanishing gradients), and the amplitude is capped at pi/2 so that
+        # distinct inputs do not alias under the 2*pi periodicity of the
+        # encoding rotations (e.g. +pi and -pi collide for RY).
+        inputs_norm = torch.tanh(inputs_reduced * self.input_scale) * (np.pi / 2)
 
         # Transpose to (Features, Total_Patches) for PennyLane parameter broadcasting
         # PennyLane iterates over the first dimension of 'inputs' to map to wires/gates
@@ -235,10 +261,18 @@ class BatchedQuantumConv2D(nn.Module):
         inputs_transposed = inputs_norm.t()
 
         # Execute Batched QNode
-        # Returns shape: (Total_Patches,)
+        # Returns a list of length n_channels, each of shape (Total_Patches,).
         results = self.circuit_runner(inputs_transposed, self.q_params)
 
-        # Reshape to feature map: (batch_size, 1, out_h, out_w)
-        output = results.view(batch_size, 1, out_h, out_w).float()
+        # Stack the per-wire expectation values into a channel dimension:
+        # (n_channels, Total_Patches)
+        results = torch.stack(results, dim=0)
+
+        # Reshape to feature map: (batch_size, n_channels, out_h, out_w)
+        output = (
+            results.reshape(self.n_channels, batch_size, out_h, out_w)
+            .permute(1, 0, 2, 3)
+            .float()
+        )
 
         return output

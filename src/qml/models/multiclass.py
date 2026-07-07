@@ -21,9 +21,14 @@ class MultiClassQCNN(nn.Module):
         ansatz: Optional[QCNNAnsatz] = None,
         measurement: str = "z",
         use_gpu: bool = False,
+        readout_wires: Optional[Union[int, List[int]]] = None,
     ):
         super().__init__()
         self.num_classes = num_classes
+
+        qconv_kernel_size = 2
+        qconv_stride = 1
+        n_qubits = 4
 
         if input_size < 3:
             raise ValueError("input_size must be >= 3 for two k=2, s=1 convolutions")
@@ -37,17 +42,45 @@ class MultiClassQCNN(nn.Module):
             nn.BatchNorm2d(16)
         )
 
+        # Learnable channel bottleneck before the quantum layer.
+        # We reduce channels so each quantum patch matches the encoding input
+        # size exactly, avoiding fixed chunk-mean reduction in the qconv.
+        if encoding == "dense":
+            required_inputs = n_qubits * 3
+        else:
+            required_inputs = n_qubits
+        patch_area = qconv_kernel_size * qconv_kernel_size
+        if required_inputs % patch_area != 0:
+            raise ValueError(
+                "qconv input requirements are not divisible by patch area"
+            )
+        qconv_input_channels = required_inputs // patch_area
+        self.qconv_channel_reduction = nn.Sequential(
+            nn.Conv2d(16, qconv_input_channels, kernel_size=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(qconv_input_channels),
+        )
+
         # Quantum conv also uses k=2, s=1:
         # (N-1)x(N-1) -> (N-2)x(N-2). For MNIST: 27x27 -> 26x26.
         self.qconv = BatchedQuantumConv2D(
-            kernel_size=2,
-            stride=1,
-            n_qubits=4,
+            kernel_size=qconv_kernel_size,
+            stride=qconv_stride,
+            n_qubits=n_qubits,
             encoding=encoding,
             ansatz=ansatz,
             measurement=measurement,
-            use_gpu=use_gpu
+            use_gpu=use_gpu,
+            readout_wires=readout_wires,
         )
+
+        # Number of quantum output channels (one per measured wire).
+        n_channels = self.qconv.n_channels
+
+        # Normalize the quantum feature map: expectation values are bounded in
+        # [-1, 1] and can drift in scale/mean across patches, so a BatchNorm
+        # stabilizes the signal fed into pooling and the classical head.
+        self.qconv_norm = nn.BatchNorm2d(n_channels)
 
         qconv_out_size = input_size - 2
         # Deterministic pooling target derived from input size.
@@ -57,7 +90,8 @@ class MultiClassQCNN(nn.Module):
 
         min_width = max(2 * num_classes, 16)
         depth = 4
-        pooled_feature_dim = pool_size * pool_size
+        # Each measured wire contributes a full pooled feature map.
+        pooled_feature_dim = n_channels * pool_size * pool_size
 
         layer_sizes = [
             w for w in (pooled_feature_dim // (2 ** i) for i in range(1, depth + 1))
@@ -80,7 +114,9 @@ class MultiClassQCNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.downsample_conv(x)
         x = self.downsample_nonlinearity(x)
+        x = self.qconv_channel_reduction(x)
         x = self.qconv(x)
+        x = self.qconv_norm(x)
         x = self.qconv_adaptive_pool(x)
         x = self.hidden_layers(x)
         return x

@@ -63,6 +63,47 @@ class DenseQCNNAnsatz4(DenseQCNNAnsatz):
         return 5
 
 
+class DenseQCNNAnsatz4NoPool(DenseQCNNAnsatz):
+    """
+    Dense QCNN-style ansatz for 4 qubits *without* pooling.
+
+    Unlike :class:`DenseQCNNAnsatz4`, no CNOT pooling layers are applied, so no
+    qubit is discarded/coarse-grained. Every wire is processed by convolution
+    blocks and remains informative, which makes this ansatz suitable for
+    multi-qubit readout (e.g. measuring an observable on all 4 qubits to emit a
+    4-channel quantum feature map).
+
+    Structure (all two-qubit dense conv blocks, no pooling):
+        Layer 1 - nearest-neighbour ring: (0,1), (1,2), (2,3), (3,0)
+        Layer 2 - cross couplings:        (0,2), (1,3)
+
+    The ring plus cross couplings entangle every pair at least once, spreading
+    information symmetrically across all qubits rather than funnelling it into a
+    single readout qubit.
+    """
+
+    def __call__(self, weights):
+        """Apply the non-pooling dense structure."""
+        if len(weights) < self.n_layers:
+            raise ValueError(
+                f"Expected {self.n_layers} weight sets, got {len(weights)}"
+            )
+
+        # Layer 1: nearest-neighbour ring convolution
+        self._apply_conv_block(weights[0], [0, 1])
+        self._apply_conv_block(weights[1], [1, 2])
+        self._apply_conv_block(weights[2], [2, 3])
+        self._apply_conv_block(weights[3], [3, 0])
+
+        # Layer 2: cross-coupling convolution (no pooling)
+        self._apply_conv_block(weights[4], [0, 2])
+        self._apply_conv_block(weights[5], [1, 3])
+
+    @property
+    def n_layers(self) -> Literal[6]:
+        return 6
+
+
 class DenseQCNNAnsatz8(DenseQCNNAnsatz):
     """
     Dense QCNN ansatz for 8 qubits.
