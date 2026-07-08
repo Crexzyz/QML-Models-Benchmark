@@ -1,0 +1,297 @@
+"""
+Headless training script for Flowers102 multiclass classification with Quantum CNN.
+Designed for queue-based HPC systems (SLURM, PBS, etc.).
+
+Outputs:
+    <output_dir>/
+        metrics.csv          - Per-epoch train/test loss and accuracy
+        training.log         - Detailed log with timestamps
+        checkpoint_epoch_N.pt - Model checkpoint per epoch
+        best_model.pt        - Best model by test accuracy
+        final_model.pt        - Final model state dict
+        config.json          - Full training configuration for reproducibility
+
+Usage:
+    python -m src.headless.train_flowers
+    python -m src.headless.train_flowers --output-dir runs/flowers_exp2 --seed 123
+"""
+
+import logging
+import random
+import sys
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, Subset
+from torchvision import transforms
+from torchvision.datasets import Flowers102
+
+from ..qml.ansatz.dense import DenseQCNNAnsatz4NoPool
+from ..qml.models.multiclass import MultiClassQCNN
+from ..training.trainers import MultiClassTrainer
+
+
+CONFIG = {
+    # Data
+    "data_root": "src/data/flowers102",
+    "image_size": 64,
+    "limit_samples": None,
+    # Model
+    "num_classes": 102,
+    "encoding": "dense",
+    "measurement": "z",
+    # Training
+    "epochs": 20,
+    "batch_size": 16,
+    "num_workers": 2,
+    "lr": 0.0015,
+    "weight_decay": 1e-5,
+    "label_smoothing": 0.05,
+    "max_grad_norm": 1.0,
+    "scheduler_factor": 0.5,
+    "scheduler_patience": 2,
+    "scheduler_min_lr": 1e-5,
+    "seed": 42,
+    # Output
+    "output_dir": "runs/flowers102",
+    "log_interval": 2,
+    "save_every": 1,
+}
+
+
+def parse_cli_overrides():
+    """Allow overriding key run settings from the CLI."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train Quantum CNN on Flowers102")
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="Override dataset root directory")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Override output directory")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Override random seed")
+    parser.add_argument("--limit-samples", type=int, default=None,
+                        help="Limit dataset size for quick validation")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override number of epochs")
+    parser.add_argument("--image-size", type=int, default=None,
+                        help="Override square resize size")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override batch size")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Override DataLoader worker count")
+    args = parser.parse_args()
+
+    config = CONFIG.copy()
+    if args.data_root is not None:
+        config["data_root"] = args.data_root
+    if args.output_dir is not None:
+        config["output_dir"] = args.output_dir
+    if args.seed is not None:
+        config["seed"] = args.seed
+    if args.limit_samples is not None:
+        config["limit_samples"] = args.limit_samples
+    if args.epochs is not None:
+        config["epochs"] = args.epochs
+    if args.image_size is not None:
+        config["image_size"] = args.image_size
+    if args.batch_size is not None:
+        config["batch_size"] = args.batch_size
+    if args.num_workers is not None:
+        config["num_workers"] = args.num_workers
+    return config
+
+
+def set_seed(seed):
+    """Set all random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_data(config, use_cuda: bool):
+    """Load and prepare Flowers102 train/test datasets."""
+    imagenet_mean = (0.485, 0.456, 0.406)
+    imagenet_std = (0.229, 0.224, 0.225)
+
+    train_transform = transforms.Compose([
+        transforms.Resize((config["image_size"], config["image_size"])),
+        transforms.ToTensor(),
+        transforms.Normalize(imagenet_mean, imagenet_std),
+    ])
+    test_transform = transforms.Compose([
+        transforms.Resize((config["image_size"], config["image_size"])),
+        transforms.ToTensor(),
+        transforms.Normalize(imagenet_mean, imagenet_std),
+    ])
+
+    train_dataset_full = Flowers102(
+        root=config["data_root"],
+        split="train",
+        download=True,
+        transform=train_transform,
+    )
+    test_dataset_full = Flowers102(
+        root=config["data_root"],
+        split="test",
+        download=True,
+        transform=test_transform,
+    )
+
+    limit = config["limit_samples"]
+    generator = torch.Generator().manual_seed(config["seed"])
+    if limit is not None:
+        train_count = min(limit, len(train_dataset_full))
+        test_count = min(max(limit // 5, 1), len(test_dataset_full))
+        train_indices = torch.randperm(
+            len(train_dataset_full), generator=generator
+        )[:train_count]
+        test_indices = torch.randperm(
+            len(test_dataset_full), generator=generator
+        )[:test_count]
+        train_dataset = Subset(train_dataset_full, train_indices.tolist())
+        test_dataset = Subset(test_dataset_full, test_indices.tolist())
+    else:
+        train_dataset = train_dataset_full
+        test_dataset = test_dataset_full
+
+    pin_memory = use_cuda
+    persistent_workers = config["num_workers"] > 0
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        num_workers=config["num_workers"],
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
+
+    classes = train_dataset_full.classes
+    return (
+        train_loader,
+        test_loader,
+        len(train_dataset),
+        len(test_dataset),
+        len(classes),
+        classes,
+    )
+
+
+def build_model(config, device):
+    """Construct the quantum CNN model."""
+
+    model = MultiClassQCNN(
+        num_classes=config["num_classes"],
+        input_size=config["image_size"],
+        encoding=config["encoding"],
+        ansatz=DenseQCNNAnsatz4NoPool(),
+        readout_wires=[0, 1, 2, 3],
+        measurement=config["measurement"],
+        use_gpu=(device.type == "cuda"),
+    )
+    return model.to(device)
+
+
+def setup_logger(output_dir: str) -> logging.Logger:
+    """Create a logger that writes to both a file and stdout."""
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+    logger = logging.getLogger(f"train_flowers102.{id(output_dir)}")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    fh = logging.FileHandler(os.path.join(output_dir, "training.log"))
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    return logger
+
+
+def main():
+    config = parse_cli_overrides()
+    set_seed(config["seed"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Data
+    train_loader, test_loader, n_train, n_test, num_classes, classes = load_data(
+        config, use_cuda=(device.type == "cuda")
+    )
+
+    # Model
+    model = build_model(config, device)
+
+    # Optimizer & loss
+    criterion = nn.CrossEntropyLoss(label_smoothing=config["label_smoothing"])
+    optimizer = optim.AdamW(
+        model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
+    )
+
+    # Learning rate scheduler: reduce LR when validation/test loss plateaus.
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=config["scheduler_factor"],
+        patience=config["scheduler_patience"],
+        min_lr=config["scheduler_min_lr"],
+    )
+
+    # Logger + trainer
+    logger = setup_logger(config["output_dir"])
+    trainer = MultiClassTrainer(
+        criterion=criterion,
+        device=device,
+        max_grad_norm=config["max_grad_norm"],
+        log_interval=config["log_interval"],
+        logger=logger,
+        output_dir=config["output_dir"],
+        save_every=config["save_every"],
+    )
+
+    # Save config & log setup info
+    config["device"] = str(device)
+    config["num_classes"] = num_classes
+    config["classes"] = classes
+    trainer.save_config(config)
+    logger.info(f"Train samples: {n_train}, Test samples: {n_test}")
+    if num_classes > 5:
+        logger.info(f"Classes ({num_classes}): {classes[:5]}...")
+    else:
+        logger.info(f"Classes ({num_classes}): {classes}")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(
+        f"Model parameters: {total_params:,} total, {trainable_params:,} trainable"
+    )
+
+    # Train
+    trainer.train(
+        model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        epochs=config["epochs"],
+        test_loader=test_loader,
+        scheduler=scheduler,
+    )
+
+
+if __name__ == "__main__":
+    main()
