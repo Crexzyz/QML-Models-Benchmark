@@ -115,14 +115,23 @@ def set_seed(seed):
 
 
 def load_data(config, use_cuda: bool):
-    """Load and prepare Flowers102 train/test datasets."""
+    """Load and prepare Flowers102 train/val/test datasets."""
     imagenet_mean = (0.485, 0.456, 0.406)
     imagenet_std = (0.229, 0.224, 0.225)
 
     train_transform = transforms.Compose([
-        transforms.Resize((config["image_size"], config["image_size"])),
+        transforms.RandomResizedCrop(
+            config["image_size"], scale=(0.6, 1.0), ratio=(0.75, 1.33)
+        ),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(p=0.15),
+        transforms.ColorJitter(
+            brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05
+        ),
+        transforms.RandomRotation(15),
         transforms.ToTensor(),
         transforms.Normalize(imagenet_mean, imagenet_std),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
     ])
     test_transform = transforms.Compose([
         transforms.Resize((config["image_size"], config["image_size"])),
@@ -136,6 +145,12 @@ def load_data(config, use_cuda: bool):
         download=True,
         transform=train_transform,
     )
+    val_dataset_full = Flowers102(
+        root=config["data_root"],
+        split="val",
+        download=True,
+        transform=test_transform,
+    )
     test_dataset_full = Flowers102(
         root=config["data_root"],
         split="test",
@@ -147,17 +162,23 @@ def load_data(config, use_cuda: bool):
     generator = torch.Generator().manual_seed(config["seed"])
     if limit is not None:
         train_count = min(limit, len(train_dataset_full))
+        val_count = min(max(limit // 5, 1), len(val_dataset_full))
         test_count = min(max(limit // 5, 1), len(test_dataset_full))
         train_indices = torch.randperm(
             len(train_dataset_full), generator=generator
         )[:train_count]
+        val_indices = torch.randperm(
+            len(val_dataset_full), generator=generator
+        )[:val_count]
         test_indices = torch.randperm(
             len(test_dataset_full), generator=generator
         )[:test_count]
         train_dataset = Subset(train_dataset_full, train_indices.tolist())
+        val_dataset = Subset(val_dataset_full, val_indices.tolist())
         test_dataset = Subset(test_dataset_full, test_indices.tolist())
     else:
         train_dataset = train_dataset_full
+        val_dataset = val_dataset_full
         test_dataset = test_dataset_full
 
     pin_memory = use_cuda
@@ -171,6 +192,14 @@ def load_data(config, use_cuda: bool):
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
     )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+    )
     test_loader = DataLoader(
         test_dataset,
         batch_size=config["batch_size"],
@@ -180,11 +209,18 @@ def load_data(config, use_cuda: bool):
         persistent_workers=persistent_workers,
     )
 
-    classes = train_dataset_full.classes
+    # torchvision compatibility: older Flowers102 versions do not expose
+    # a ``classes`` attribute. Fall back to deterministic class labels.
+    if hasattr(train_dataset_full, "classes"):
+        classes = train_dataset_full.classes
+    else:
+        classes = [f"class_{i}" for i in range(config["num_classes"])]
     return (
         train_loader,
+        val_loader,
         test_loader,
         len(train_dataset),
+        len(val_dataset),
         len(test_dataset),
         len(classes),
         classes,
@@ -231,9 +267,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Data
-    train_loader, test_loader, n_train, n_test, num_classes, classes = load_data(
-        config, use_cuda=(device.type == "cuda")
-    )
+    (
+        train_loader,
+        val_loader,
+        test_loader,
+        n_train,
+        n_val,
+        n_test,
+        num_classes,
+        classes,
+    ) = load_data(config, use_cuda=(device.type == "cuda"))
 
     # Model
     model = build_model(config, device)
@@ -270,7 +313,9 @@ def main():
     config["num_classes"] = num_classes
     config["classes"] = classes
     trainer.save_config(config)
-    logger.info(f"Train samples: {n_train}, Test samples: {n_test}")
+    logger.info(
+        f"Train samples: {n_train}, Val samples: {n_val}, Test samples: {n_test}"
+    )
     if num_classes > 5:
         logger.info(f"Classes ({num_classes}): {classes[:5]}...")
     else:
@@ -288,8 +333,28 @@ def main():
         train_loader=train_loader,
         optimizer=optimizer,
         epochs=config["epochs"],
-        test_loader=test_loader,
+        test_loader=val_loader,
         scheduler=scheduler,
+    )
+
+    # Final test evaluation using the best validation checkpoint.
+    import os
+
+    best_model_path = os.path.join(config["output_dir"], "best_model.pt")
+    if os.path.exists(best_model_path):
+        checkpoint = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        logger.info(f"Loaded best validation model from {best_model_path}")
+
+    test_metrics, _ = trainer.evaluate(model, test_loader)
+    test_loss = float("nan")
+    test_acc = float("nan")
+    if isinstance(test_metrics, dict):
+        test_loss = float(test_metrics.get("loss", float("nan")))
+        test_acc = float(test_metrics.get("acc", float("nan")))
+    logger.info(
+        "Final Test | "
+        f"Loss={test_loss:.4f}, Acc={test_acc:.4f}"
     )
 
 
