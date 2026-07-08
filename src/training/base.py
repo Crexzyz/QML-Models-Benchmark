@@ -166,8 +166,9 @@ class BaseTrainer(ABC):
             )
 
             for batch_idx, (images, labels) in enumerate(loop):
-                images = images.to(self.device)
-                labels = labels.to(self.device)
+                non_blocking = self.device.type == "cuda"
+                images = images.to(self.device, non_blocking=non_blocking)
+                labels = labels.to(self.device, non_blocking=non_blocking)
                 if isinstance(self.criterion, (
                     torch.nn.BCELoss, torch.nn.BCEWithLogitsLoss,
                 )):

@@ -45,6 +45,7 @@ CONFIG = {
     # Training
     "epochs": 20,
     "batch_size": 32,
+    "num_workers": 2,
     "lr": 0.002,
     "weight_decay": 1e-5,
     "label_smoothing": 0.05,
@@ -96,7 +97,7 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def load_data(config):
+def load_data(config, use_cuda: bool):
     """Load and prepare MNIST train/test datasets."""
     transform = transforms.Compose([
         # MultiClassQCNN expects 3 input channels.
@@ -124,11 +125,24 @@ def load_data(config):
         train_dataset = train_dataset_full
         test_dataset = test_dataset_full
 
+    pin_memory = use_cuda
+    persistent_workers = config["num_workers"] > 0
+
     train_loader = DataLoader(
-        train_dataset, batch_size=config["batch_size"], shuffle=True
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        num_workers=config["num_workers"],
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
     test_loader = DataLoader(
-        test_dataset, batch_size=config["batch_size"], shuffle=False
+        test_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
 
     return train_loader, test_loader, len(train_dataset), len(test_dataset)
@@ -174,7 +188,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Data
-    train_loader, test_loader, n_train, n_test = load_data(config)
+    train_loader, test_loader, n_train, n_test = load_data(
+        config, use_cuda=(device.type == "cuda")
+    )
 
     # Model
     model = build_model(config, device)
