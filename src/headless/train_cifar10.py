@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 from ..qml.ansatz.dense import DenseQCNNAnsatz4NoPool
-from ..qml.models.multiclass import MultiClassQCNN
+from ..qml.models.multiclass import MultiClassCNN, MultiClassQCNN
 from ..training.trainers import MultiClassTrainer
 
 
@@ -40,6 +40,7 @@ CONFIG = {
     "limit_samples": None,
     # Model
     "num_classes": 10,
+    "use_classical": False,
     "encoding": "dense",
     "measurement": "z",
     # Training
@@ -82,6 +83,11 @@ def parse_cli_overrides():
                         help="Override batch size")
     parser.add_argument("--num-workers", type=int, default=None,
                         help="Override DataLoader worker count")
+    parser.add_argument(
+        "--use-classical",
+        action="store_true",
+        help="Use MultiClassCNN instead of MultiClassQCNN",
+    )
     args = parser.parse_args()
 
     config = CONFIG.copy()
@@ -101,6 +107,8 @@ def parse_cli_overrides():
         config["batch_size"] = args.batch_size
     if args.num_workers is not None:
         config["num_workers"] = args.num_workers
+    if args.use_classical:
+        config["use_classical"] = True
     return config
 
 
@@ -197,6 +205,10 @@ def load_data(config, use_cuda: bool):
 
 def build_model(config, device):
     """Construct the quantum CNN model."""
+
+    if config.get("use_classical", False):
+        model = MultiClassCNN(num_classes=config["num_classes"])
+        return model.to(device)
 
     model = MultiClassQCNN(
         num_classes=config["num_classes"],

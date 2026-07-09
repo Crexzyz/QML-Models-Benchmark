@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchvision import datasets, transforms
 
-from ..qml.models.multiclass import MultiClassQCNN
+from ..qml.models.multiclass import MultiClassCNN, MultiClassQCNN
 from ..qml.ansatz.dense import DenseQCNNAnsatz4NoPool
 from ..training.trainers import MultiClassTrainer
 
@@ -40,6 +40,7 @@ CONFIG = {
     "limit_samples": None,
     # Model
     "num_classes": 10,
+    "use_classical": False,
     "encoding": "dense",
     "measurement": "z",
     # Training
@@ -74,6 +75,11 @@ def parse_cli_overrides():
                         help="Limit dataset size for quick validation")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of epochs")
+    parser.add_argument(
+        "--use-classical",
+        action="store_true",
+        help="Use MultiClassCNN instead of MultiClassQCNN",
+    )
     args = parser.parse_args()
 
     config = CONFIG.copy()
@@ -85,6 +91,8 @@ def parse_cli_overrides():
         config["limit_samples"] = args.limit_samples
     if args.epochs is not None:
         config["epochs"] = args.epochs
+    if args.use_classical:
+        config["use_classical"] = True
     return config
 
 
@@ -150,6 +158,10 @@ def load_data(config, use_cuda: bool):
 
 def build_model(config, device):
     """Construct the quantum CNN model, selecting GPU-batched variant if CUDA."""
+
+    if config.get("use_classical", False):
+        model = MultiClassCNN(num_classes=config["num_classes"])
+        return model.to(device)
 
     model = MultiClassQCNN(
         num_classes=config["num_classes"],
