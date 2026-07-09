@@ -57,7 +57,7 @@ CONFIG = {
     "seed": 42,
     # Output
     "output_dir": "runs/mnist",
-    "log_interval": 2,
+    "log_interval": 20,
     "save_every": 1,
 }
 

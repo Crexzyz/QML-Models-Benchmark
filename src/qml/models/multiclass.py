@@ -170,7 +170,7 @@ class MultiClassCNN(nn.Module):
             nn.BatchNorm2d(classical_conv_input_channels),
         )
 
-        n_channels = 1
+        n_channels = 4
 
         # Classical replacement for the quantum convolution with matching
         # kernel/stride/output channel count.
