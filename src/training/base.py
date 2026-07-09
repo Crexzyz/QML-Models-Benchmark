@@ -131,6 +131,21 @@ class BaseTrainer(ABC):
     def _evaluate_batch(self, outputs, labels) -> tuple[torch.Tensor, int, int]:
         pass
 
+    def _compute_confusion_matrix(
+        self,
+        all_labels: np.ndarray,
+        all_preds: np.ndarray,
+    ) -> np.ndarray | None:
+        """Optional confusion matrix hook for single-label tasks."""
+        return None
+
+    def _compute_additional_metrics(
+        self,
+        confusion_matrix: np.ndarray | None,
+    ) -> dict:
+        """Optional additional metrics derived from evaluation outputs."""
+        return {}
+
     def train(
         self, model, train_loader, optimizer, epochs, test_loader=None, scheduler=None
     ) -> dict[str, list]:
@@ -320,7 +335,7 @@ class BaseTrainer(ABC):
 
         return result
 
-    def evaluate(self, model, test_loader) -> tuple[tuple[float, float], np.ndarray]:
+    def evaluate(self, model, test_loader) -> tuple[dict, np.ndarray]:
         """
         Evaluate the model on the test data.
 
@@ -330,8 +345,8 @@ class BaseTrainer(ABC):
 
         Returns:
             A tuple containing:
-                - A tuple of (test_loss, test_accuracy)
-                - A numpy array of predictions for the test set
+                - A dictionary with loss/accuracy and optional extra metrics
+                - A confusion matrix when available (otherwise empty matrix)
         """
         model.to(self.device)
         model.eval()
@@ -340,7 +355,8 @@ class BaseTrainer(ABC):
         correct = 0
         total = 0
 
-        # For confusion matrix: [TN, FP, FN, TP]
+        # Collect predictions/labels for optional confusion matrix and
+        # derived metrics.
         all_preds = []
         all_labels = []
 
@@ -362,14 +378,12 @@ class BaseTrainer(ABC):
 
                 total_loss += loss.item() * images.size(0)
 
-                # Get predictions for binary classification
                 preds, batch_correct, batch_total = self._evaluate_batch(
                     outputs, labels
                 )
                 correct += batch_correct
                 total += batch_total
 
-                # Store for confusion matrix
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.long().cpu().numpy())
 
@@ -377,15 +391,14 @@ class BaseTrainer(ABC):
         avg_loss = total_loss / total
         accuracy = correct / total
 
-        # Build confusion matrix
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
 
-        tn = np.sum((all_labels == 0) & (all_preds == 0))
-        fp = np.sum((all_labels == 0) & (all_preds == 1))
-        fn = np.sum((all_labels == 1) & (all_preds == 0))
-        tp = np.sum((all_labels == 1) & (all_preds == 1))
+        confusion_matrix = self._compute_confusion_matrix(all_labels, all_preds)
+        metrics = {"loss": avg_loss, "acc": accuracy}
+        metrics.update(self._compute_additional_metrics(confusion_matrix))
 
-        confusion_matrix = np.array([[tn, fp], [fn, tp]])
+        if confusion_matrix is None:
+            confusion_matrix = np.zeros((0, 0), dtype=int)
 
-        return {"loss": avg_loss, "acc": accuracy}, confusion_matrix
+        return metrics, confusion_matrix

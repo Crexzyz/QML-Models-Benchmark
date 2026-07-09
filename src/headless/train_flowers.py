@@ -272,6 +272,30 @@ def setup_logger(output_dir: str) -> logging.Logger:
     return logger
 
 
+def save_confusion_matrix(
+    output_dir: str,
+    confusion_matrix: np.ndarray,
+    class_labels=None,
+) -> str:
+    """Save a labeled confusion matrix CSV and return its path."""
+    import csv
+    import os
+
+    path = os.path.join(output_dir, "confusion_matrix_best.csv")
+    if class_labels is None:
+        class_labels = [str(i) for i in range(confusion_matrix.shape[0])]
+    else:
+        class_labels = [str(label) for label in class_labels]
+
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["", *class_labels])
+        for idx, row in enumerate(confusion_matrix.astype(int)):
+            writer.writerow([class_labels[idx], *row.tolist()])
+
+    return path
+
+
 def main():
     config = parse_cli_overrides()
     set_seed(config["seed"])
@@ -357,7 +381,12 @@ def main():
         model.load_state_dict(checkpoint["model_state_dict"])
         logger.info(f"Loaded best validation model from {best_model_path}")
 
-    test_metrics, _ = trainer.evaluate(model, test_loader)
+    test_metrics, confusion_matrix = trainer.evaluate(model, test_loader)
+    cm_path = save_confusion_matrix(
+        config["output_dir"],
+        confusion_matrix,
+        classes,
+    )
     test_loss = float("nan")
     test_acc = float("nan")
     if isinstance(test_metrics, dict):
@@ -367,6 +396,7 @@ def main():
         "Final Test | "
         f"Loss={test_loss:.4f}, Acc={test_acc:.4f}"
     )
+    logger.info(f"Confusion matrix saved to {cm_path}")
 
 
 if __name__ == "__main__":

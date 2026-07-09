@@ -57,7 +57,7 @@ CONFIG = {
     "seed": 42,
     # Output
     "output_dir": "runs/cifar10",
-    "log_interval": 20,
+    "log_interval": 100,
     "save_every": 1,
 }
 
@@ -241,6 +241,30 @@ def setup_logger(output_dir: str) -> logging.Logger:
     return logger
 
 
+def save_confusion_matrix(
+    output_dir: str,
+    confusion_matrix: np.ndarray,
+    class_labels=None,
+) -> str:
+    """Save a labeled confusion matrix CSV and return its path."""
+    import csv
+    import os
+
+    path = os.path.join(output_dir, "confusion_matrix_best.csv")
+    if class_labels is None:
+        class_labels = [str(i) for i in range(confusion_matrix.shape[0])]
+    else:
+        class_labels = [str(label) for label in class_labels]
+
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["", *class_labels])
+        for idx, row in enumerate(confusion_matrix.astype(int)):
+            writer.writerow([class_labels[idx], *row.tolist()])
+
+    return path
+
+
 def main():
     config = parse_cli_overrides()
     set_seed(config["seed"])
@@ -307,6 +331,29 @@ def main():
         test_loader=test_loader,
         scheduler=scheduler,
     )
+
+    # Evaluate and export confusion matrix for the best checkpoint.
+    import os
+
+    best_model_path = os.path.join(config["output_dir"], "best_model.pt")
+    if os.path.exists(best_model_path):
+        checkpoint = torch.load(best_model_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        logger.info(f"Loaded best model from {best_model_path}")
+    else:
+        logger.info("best_model.pt not found; using final model for evaluation")
+
+    best_metrics, confusion_matrix = trainer.evaluate(model, test_loader)
+    cm_path = save_confusion_matrix(
+        config["output_dir"],
+        confusion_matrix,
+        classes,
+    )
+    logger.info(
+        "Best Test | "
+        f"Loss={best_metrics['loss']:.4f}, Acc={best_metrics['acc']:.4f}"
+    )
+    logger.info(f"Confusion matrix saved to {cm_path}")
 
 
 if __name__ == "__main__":
