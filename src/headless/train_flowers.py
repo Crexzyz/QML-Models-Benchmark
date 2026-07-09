@@ -232,7 +232,6 @@ def build_model(config, device):
 
     model = MultiClassQCNN(
         num_classes=config["num_classes"],
-        input_size=config["image_size"],
         encoding=config["encoding"],
         ansatz=DenseQCNNAnsatz4NoPool(),
         readout_wires=[0, 1, 2, 3],

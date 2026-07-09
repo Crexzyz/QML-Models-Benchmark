@@ -16,7 +16,6 @@ class MultiClassQCNN(nn.Module):
     def __init__(
         self,
         num_classes: int,
-        input_size: int,
         encoding: str = "ry",
         ansatz: Optional[QCNNAnsatz] = None,
         measurement: str = "z",
@@ -25,17 +24,15 @@ class MultiClassQCNN(nn.Module):
     ):
         super().__init__()
         self.num_classes = num_classes
+        self.min_input_size = 4
 
         qconv_kernel_size = 2
         qconv_stride = 1
         n_qubits = 4
 
-        if input_size < 3:
-            raise ValueError("input_size must be >= 3 for two k=2, s=1 convolutions")
-
         # Input image: (B, 3, N, N)
-        # For MNIST (N=28): 28x28 -> 27x27 after this layer.
-        self.downsample_conv = nn.Conv2d(3, 16, kernel_size=2, stride=1)
+        # Stride-2 stem to reduce quantum patch count.
+        self.downsample_conv = nn.Conv2d(3, 16, kernel_size=2, stride=2)
 
         self.downsample_nonlinearity = nn.Sequential(
             nn.ReLU(),
@@ -82,10 +79,9 @@ class MultiClassQCNN(nn.Module):
         # stabilizes the signal fed into pooling and the classical head.
         self.qconv_norm = nn.BatchNorm2d(n_channels)
 
-        qconv_out_size = input_size - 2
-        # Deterministic pooling target derived from input size.
-        # For MNIST: qconv_out_size=26 -> pool_size=6.
-        pool_size = max(1, qconv_out_size // 4)
+        # Fixed pooled output keeps classifier size independent of input image
+        # size while still allowing variable-sized valid inputs at runtime.
+        pool_size = 8
         self.qconv_adaptive_pool = nn.AdaptiveAvgPool2d((pool_size, pool_size))
 
         min_width = max(2 * num_classes, 16)
@@ -112,12 +108,132 @@ class MultiClassQCNN(nn.Module):
         self.hidden_layers = nn.Sequential(*flat_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(
+                "MultiClassQCNN expects input with shape (B, C, H, W), "
+                f"got {tuple(x.shape)}"
+            )
+
+        height, width = x.shape[-2], x.shape[-1]
+        if height != width:
+            raise ValueError(
+                f"MultiClassQCNN expects square inputs, got {height}x{width}"
+            )
+        if height < self.min_input_size:
+            raise ValueError(
+                "MultiClassQCNN expects input size >= "
+                f"{self.min_input_size}, got {height}"
+            )
+
         x = self.downsample_conv(x)
         x = self.downsample_nonlinearity(x)
         x = self.qconv_channel_reduction(x)
         x = self.qconv(x)
         x = self.qconv_norm(x)
         x = self.qconv_adaptive_pool(x)
+        x = self.hidden_layers(x)
+        return x
+
+
+class MultiClassCNN(nn.Module):
+    """
+    Classical counterpart to MultiClassQCNN.
+    Matches the architecture and tensor shapes as closely as possible while
+    replacing the quantum convolution with a classical Conv2d.
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.min_input_size = 4
+
+        classical_conv_kernel_size = 2
+        classical_conv_stride = 1
+
+        # Input image: (B, 3, N, N)
+        # Stride-2 stem to reduce classical patch count.
+        self.downsample_conv = nn.Conv2d(3, 16, kernel_size=2, stride=2)
+
+        self.downsample_nonlinearity = nn.Sequential(
+            nn.ReLU(),
+            nn.BatchNorm2d(16)
+        )
+
+        # Fixed channel mapping for the classical surrogate.
+        classical_conv_input_channels = 1
+        self.classical_channel_reduction = nn.Sequential(
+            nn.Conv2d(16, classical_conv_input_channels, kernel_size=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(classical_conv_input_channels),
+        )
+
+        n_channels = 1
+
+        # Classical replacement for the quantum convolution with matching
+        # kernel/stride/output channel count.
+        self.classical_conv = nn.Conv2d(
+            in_channels=classical_conv_input_channels,
+            out_channels=n_channels,
+            kernel_size=classical_conv_kernel_size,
+            stride=classical_conv_stride,
+        )
+
+        self.classical_conv_norm = nn.BatchNorm2d(n_channels)
+
+        # Fixed pooled output keeps classifier size independent of input image
+        # size while still allowing variable-sized valid inputs at runtime.
+        pool_size = 8
+        self.classical_adaptive_pool = nn.AdaptiveAvgPool2d((pool_size, pool_size))
+
+        min_width = max(2 * num_classes, 16)
+        depth = 4
+        pooled_feature_dim = n_channels * pool_size * pool_size
+
+        layer_sizes = [
+            w for w in (pooled_feature_dim // (2 ** i) for i in range(1, depth + 1))
+            if w >= min_width
+        ]
+
+        flat_layers: List[nn.Module] = [nn.Flatten()]
+
+        loop_size = pooled_feature_dim
+        for size in layer_sizes:
+            flat_layers.append(nn.Linear(loop_size, size))
+            flat_layers.append(nn.ReLU())
+            flat_layers.append(nn.Dropout(0.2))
+            loop_size = size
+
+        flat_layers.append(nn.Linear(loop_size, num_classes))
+
+        self.hidden_layers = nn.Sequential(*flat_layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(
+                "MultiClassCNN expects input with shape (B, C, H, W), "
+                f"got {tuple(x.shape)}"
+            )
+
+        height, width = x.shape[-2], x.shape[-1]
+        if height != width:
+            raise ValueError(
+                f"MultiClassCNN expects square inputs, got {height}x{width}"
+            )
+        if height < self.min_input_size:
+            raise ValueError(
+                "MultiClassCNN expects input size >= "
+                f"{self.min_input_size}, got {height}"
+            )
+
+        x = self.downsample_conv(x)
+        x = self.downsample_nonlinearity(x)
+        x = self.classical_channel_reduction(x)
+        x = self.classical_conv(x)
+        x = self.classical_conv_norm(x)
+        x = self.classical_adaptive_pool(x)
         x = self.hidden_layers(x)
         return x
 

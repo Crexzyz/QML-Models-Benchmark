@@ -1,5 +1,5 @@
 """
-Headless training script for MNIST multiclass classification with Quantum CNN.
+Headless training script for CIFAR-10 multiclass classification with Quantum CNN.
 Designed for queue-based HPC systems (SLURM, PBS, etc.).
 
 Outputs:
@@ -12,8 +12,8 @@ Outputs:
         config.json          - Full training configuration for reproducibility
 
 Usage:
-    python -m src.headless.train_mnist
-    python -m src.headless.train_mnist --output-dir runs/mnist_exp2 --seed 123
+    python -m src.headless.train_cifar10
+    python -m src.headless.train_cifar10 --output-dir runs/cifar10_exp2 --seed 123
 """
 
 import logging
@@ -24,19 +24,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
-from ..qml.models.multiclass import MultiClassQCNN
 from ..qml.ansatz.dense import DenseQCNNAnsatz4NoPool
+from ..qml.models.multiclass import MultiClassQCNN
 from ..training.trainers import MultiClassTrainer
 
 
 CONFIG = {
     # Data
-    "data_root": "src/data/MNIST",
-    "image_size": 28,
+    "data_root": "src/data/cifar10",
+    "image_size": 32,
     "limit_samples": None,
     # Model
     "num_classes": 10,
@@ -46,7 +46,7 @@ CONFIG = {
     "epochs": 20,
     "batch_size": 32,
     "num_workers": 2,
-    "lr": 0.002,
+    "lr": 0.0015,
     "weight_decay": 1e-5,
     "label_smoothing": 0.05,
     "max_grad_norm": 1.0,
@@ -55,17 +55,19 @@ CONFIG = {
     "scheduler_min_lr": 1e-5,
     "seed": 42,
     # Output
-    "output_dir": "runs/mnist",
+    "output_dir": "runs/cifar10",
     "log_interval": 2,
     "save_every": 1,
 }
 
 
 def parse_cli_overrides():
-    """Allow overriding output_dir, seed, and limit_samples from CLI."""
+    """Allow overriding key run settings from the CLI."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train Quantum CNN on MNIST")
+    parser = argparse.ArgumentParser(description="Train Quantum CNN on CIFAR-10")
+    parser.add_argument("--data-root", type=str, default=None,
+                        help="Override dataset root directory")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output directory")
     parser.add_argument("--seed", type=int, default=None,
@@ -74,9 +76,17 @@ def parse_cli_overrides():
                         help="Limit dataset size for quick validation")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of epochs")
+    parser.add_argument("--image-size", type=int, default=None,
+                        help="Override square resize size")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override batch size")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="Override DataLoader worker count")
     args = parser.parse_args()
 
     config = CONFIG.copy()
+    if args.data_root is not None:
+        config["data_root"] = args.data_root
     if args.output_dir is not None:
         config["output_dir"] = args.output_dir
     if args.seed is not None:
@@ -85,6 +95,12 @@ def parse_cli_overrides():
         config["limit_samples"] = args.limit_samples
     if args.epochs is not None:
         config["epochs"] = args.epochs
+    if args.image_size is not None:
+        config["image_size"] = args.image_size
+    if args.batch_size is not None:
+        config["batch_size"] = args.batch_size
+    if args.num_workers is not None:
+        config["num_workers"] = args.num_workers
     return config
 
 
@@ -98,29 +114,52 @@ def set_seed(seed):
 
 
 def load_data(config, use_cuda: bool):
-    """Load and prepare MNIST train/test datasets."""
-    transform = transforms.Compose([
-        # MultiClassQCNN expects 3 input channels.
-        transforms.Grayscale(num_output_channels=3),
+    """Load and prepare CIFAR-10 train/test datasets."""
+    cifar10_mean = (0.4914, 0.4822, 0.4465)
+    cifar10_std = (0.2023, 0.1994, 0.2010)
+
+    train_transform = transforms.Compose([
+        transforms.Resize((config["image_size"], config["image_size"])),
+        transforms.RandomResizedCrop(
+            config["image_size"], scale=(0.7, 1.0), ratio=(0.8, 1.25)
+        ),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(config["image_size"], padding=4),
+        transforms.ColorJitter(
+            brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05
+        ),
+        transforms.RandomRotation(12),
         transforms.ToTensor(),
-        transforms.Normalize((0.1307, 0.1307, 0.1307), (0.3081, 0.3081, 0.3081)),
+        transforms.Normalize(cifar10_mean, cifar10_std),
+        # CIFAR-style cutout-like regularization.
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.2), ratio=(0.3, 3.3)),
+    ])
+    test_transform = transforms.Compose([
+        transforms.Resize((config["image_size"], config["image_size"])),
+        transforms.ToTensor(),
+        transforms.Normalize(cifar10_mean, cifar10_std),
     ])
 
-    train_dataset_full = datasets.MNIST(
-        root=config["data_root"], train=True, download=True, transform=transform
+    train_dataset_full = datasets.CIFAR10(
+        root=config["data_root"], train=True, download=True, transform=train_transform
     )
-    test_dataset_full = datasets.MNIST(
-        root=config["data_root"], train=False, download=True, transform=transform
+    test_dataset_full = datasets.CIFAR10(
+        root=config["data_root"], train=False, download=True, transform=test_transform
     )
 
     limit = config["limit_samples"]
+    generator = torch.Generator().manual_seed(config["seed"])
     if limit is not None:
-        train_dataset = Subset(
-            train_dataset_full, range(min(limit, len(train_dataset_full)))
-        )
-        test_dataset = Subset(
-            test_dataset_full, range(min(limit // 5, len(test_dataset_full)))
-        )
+        train_count = min(limit, len(train_dataset_full))
+        test_count = min(max(limit // 5, 1), len(test_dataset_full))
+        train_indices = torch.randperm(
+            len(train_dataset_full), generator=generator
+        )[:train_count]
+        test_indices = torch.randperm(
+            len(test_dataset_full), generator=generator
+        )[:test_count]
+        train_dataset = Subset(train_dataset_full, train_indices.tolist())
+        test_dataset = Subset(test_dataset_full, test_indices.tolist())
     else:
         train_dataset = train_dataset_full
         test_dataset = test_dataset_full
@@ -145,11 +184,19 @@ def load_data(config, use_cuda: bool):
         persistent_workers=persistent_workers,
     )
 
-    return train_loader, test_loader, len(train_dataset), len(test_dataset)
+    classes = train_dataset_full.classes
+    return (
+        train_loader,
+        test_loader,
+        len(train_dataset),
+        len(test_dataset),
+        len(classes),
+        classes,
+    )
 
 
 def build_model(config, device):
-    """Construct the quantum CNN model, selecting GPU-batched variant if CUDA."""
+    """Construct the quantum CNN model."""
 
     model = MultiClassQCNN(
         num_classes=config["num_classes"],
@@ -165,8 +212,9 @@ def build_model(config, device):
 def setup_logger(output_dir: str) -> logging.Logger:
     """Create a logger that writes to both a file and stdout."""
     import os
+
     os.makedirs(output_dir, exist_ok=True)
-    logger = logging.getLogger(f"train_mnist.{id(output_dir)}")
+    logger = logging.getLogger(f"train_cifar10.{id(output_dir)}")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -187,7 +235,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Data
-    train_loader, test_loader, n_train, n_test = load_data(
+    train_loader, test_loader, n_train, n_test, num_classes, classes = load_data(
         config, use_cuda=(device.type == "cuda")
     )
 
@@ -223,8 +271,14 @@ def main():
 
     # Save config & log setup info
     config["device"] = str(device)
+    config["num_classes"] = num_classes
+    config["classes"] = classes
     trainer.save_config(config)
     logger.info(f"Train samples: {n_train}, Test samples: {n_test}")
+    if num_classes > 5:
+        logger.info(f"Classes ({num_classes}): {classes[:5]}...")
+    else:
+        logger.info(f"Classes ({num_classes}): {classes}")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
