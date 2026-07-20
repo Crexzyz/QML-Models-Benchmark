@@ -2,6 +2,8 @@
 Quantum convolutional layers for hybrid quantum-classical neural networks.
 """
 
+import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -144,6 +146,26 @@ class BatchedQuantumConv2D(nn.Module):
             ]
 
         self.circuit_runner = circuit
+        self.reset_cost_metrics()
+
+    def reset_cost_metrics(self):
+        """Reset accumulated forward-pass cost metrics."""
+        self._cost_metrics = {
+            "forward_calls": 0,
+            "circuit_executions": 0,
+            "patches": 0,
+            "layer_forward_time_s": 0.0,
+            "circuit_time_s": 0.0,
+        }
+
+    def get_cost_metrics(self) -> dict:
+        """Return accumulated forward-pass cost metrics."""
+        return self._cost_metrics.copy()
+
+    @staticmethod
+    def _synchronize_if_cuda(tensor):
+        if tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
 
     def encode_data(self, inputs):
         """
@@ -212,6 +234,8 @@ class BatchedQuantumConv2D(nn.Module):
             Tensor of shape (batch_size, n_channels, out_height, out_width),
             where n_channels == len(readout_wires).
         """
+        self._synchronize_if_cuda(x)
+        layer_start = time.perf_counter()
         batch_size, channels, height, width = x.shape
 
         # Extract patches
@@ -262,7 +286,11 @@ class BatchedQuantumConv2D(nn.Module):
 
         # Execute Batched QNode
         # Returns a list of length n_channels, each of shape (Total_Patches,).
+        self._synchronize_if_cuda(x)
+        circuit_start = time.perf_counter()
         results = self.circuit_runner(inputs_transposed, self.q_params)
+        self._synchronize_if_cuda(x)
+        circuit_time = time.perf_counter() - circuit_start
 
         # Stack the per-wire expectation values into a channel dimension:
         # (n_channels, Total_Patches)
@@ -275,4 +303,11 @@ class BatchedQuantumConv2D(nn.Module):
             .float()
         )
 
+        self._synchronize_if_cuda(x)
+        layer_time = time.perf_counter() - layer_start
+        self._cost_metrics["forward_calls"] += 1
+        self._cost_metrics["circuit_executions"] += 1
+        self._cost_metrics["patches"] += total_patches
+        self._cost_metrics["layer_forward_time_s"] += layer_time
+        self._cost_metrics["circuit_time_s"] += circuit_time
         return output

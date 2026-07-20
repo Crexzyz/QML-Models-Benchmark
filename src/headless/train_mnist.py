@@ -17,8 +17,10 @@ Usage:
 """
 
 import logging
+import os
 import random
 import sys
+from functools import partial
 
 import numpy as np
 import torch
@@ -98,11 +100,22 @@ def parse_cli_overrides():
 
 def set_seed(seed):
     """Set all random seeds for reproducibility."""
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def seed_worker(worker_id, base_seed):
+    """Seed Python and NumPy RNGs in each DataLoader worker."""
+    worker_seed = (base_seed + worker_id) % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def load_data(config, use_cuda: bool):
@@ -135,6 +148,9 @@ def load_data(config, use_cuda: bool):
 
     pin_memory = use_cuda
     persistent_workers = config["num_workers"] > 0
+    train_generator = torch.Generator().manual_seed(config["seed"])
+    test_generator = torch.Generator().manual_seed(config["seed"] + 1)
+    worker_init_fn = partial(seed_worker, base_seed=config["seed"])
 
     train_loader = DataLoader(
         train_dataset,
@@ -143,6 +159,8 @@ def load_data(config, use_cuda: bool):
         num_workers=config["num_workers"],
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
+        worker_init_fn=worker_init_fn,
+        generator=train_generator,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -151,6 +169,8 @@ def load_data(config, use_cuda: bool):
         num_workers=config["num_workers"],
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
+        worker_init_fn=worker_init_fn,
+        generator=test_generator,
     )
 
     return train_loader, test_loader, len(train_dataset), len(test_dataset)

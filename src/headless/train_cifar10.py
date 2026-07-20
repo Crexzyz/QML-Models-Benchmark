@@ -17,8 +17,10 @@ Usage:
 """
 
 import logging
+import os
 import random
 import sys
+from functools import partial
 
 import numpy as np
 import torch
@@ -114,11 +116,22 @@ def parse_cli_overrides():
 
 def set_seed(seed):
     """Set all random seeds for reproducibility."""
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def seed_worker(worker_id, base_seed):
+    """Seed Python and NumPy RNGs in each DataLoader worker."""
+    worker_seed = (base_seed + worker_id) % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def load_data(config, use_cuda: bool):
@@ -156,15 +169,15 @@ def load_data(config, use_cuda: bool):
     )
 
     limit = config["limit_samples"]
-    generator = torch.Generator().manual_seed(config["seed"])
+    subset_generator = torch.Generator().manual_seed(config["seed"])
     if limit is not None:
         train_count = min(limit, len(train_dataset_full))
         test_count = min(max(limit // 5, 1), len(test_dataset_full))
         train_indices = torch.randperm(
-            len(train_dataset_full), generator=generator
+            len(train_dataset_full), generator=subset_generator
         )[:train_count]
         test_indices = torch.randperm(
-            len(test_dataset_full), generator=generator
+            len(test_dataset_full), generator=subset_generator
         )[:test_count]
         train_dataset = Subset(train_dataset_full, train_indices.tolist())
         test_dataset = Subset(test_dataset_full, test_indices.tolist())
@@ -174,6 +187,9 @@ def load_data(config, use_cuda: bool):
 
     pin_memory = use_cuda
     persistent_workers = config["num_workers"] > 0
+    train_generator = torch.Generator().manual_seed(config["seed"])
+    test_generator = torch.Generator().manual_seed(config["seed"] + 1)
+    worker_init_fn = partial(seed_worker, base_seed=config["seed"])
 
     train_loader = DataLoader(
         train_dataset,
@@ -182,6 +198,8 @@ def load_data(config, use_cuda: bool):
         num_workers=config["num_workers"],
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
+        worker_init_fn=worker_init_fn,
+        generator=train_generator,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -190,6 +208,8 @@ def load_data(config, use_cuda: bool):
         num_workers=config["num_workers"],
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
+        worker_init_fn=worker_init_fn,
+        generator=test_generator,
     )
 
     classes = train_dataset_full.classes
