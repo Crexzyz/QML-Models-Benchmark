@@ -24,10 +24,7 @@ Usage:
     python -m src.headless.train_patternnet --data-root data/PatternNet
 """
 
-import logging
 import os
-import random
-import sys
 from functools import partial
 
 import numpy as np
@@ -39,9 +36,15 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
-from ..qml.ansatz.dense import DenseQCNNAnsatz4NoPool
 from ..qml.models.multiclass import MultiClassCNN, MultiClassQCNN
 from ..training.trainers import MultiClassTrainer
+from ..training.shared import (
+    set_seed,
+    seed_worker,
+    build_ansatz,
+    setup_logger,
+    save_confusion_matrix
+)
 
 
 PATTERNNET_DOWNLOAD_URL = (
@@ -61,6 +64,7 @@ CONFIG = {
     "num_classes": 38,
     "use_classical": False,
     "encoding": "dense",
+    "ansatz": "dense",
     "measurement": "z",
     # Training
     "epochs": 20,
@@ -253,12 +257,32 @@ def parse_cli_overrides():
         action="store_true",
         help="Use MultiClassCNN instead of MultiClassQCNN",
     )
+    parser.add_argument(
+        "--encoding",
+        type=str,
+        choices=["rx", "ry", "rz", "dense"],
+        default=None,
+        help="Quantum encoding strategy",
+    )
+    parser.add_argument(
+        "--ansatz",
+        type=str,
+        choices=["rx", "ry", "rz", "dense"],
+        default=None,
+        help="Dense ansatz or single-axis ansatz for the QCNN",
+    )
+    parser.add_argument(
+        "--measurement",
+        type=str,
+        choices=["x", "y", "z"],
+        default=None,
+        help="Measurement axis",
+    )
     args = parser.parse_args()
 
     config = CONFIG.copy()
     for key in (
         "data_root",
-        "output_dir",
         "seed",
         "limit_samples",
         "epochs",
@@ -271,27 +295,27 @@ def parse_cli_overrides():
             config[key] = value
     if args.use_classical:
         config["use_classical"] = True
+    if args.encoding is not None:
+        config["encoding"] = args.encoding
+    if args.ansatz is not None:
+        config["ansatz"] = args.ansatz
+    if args.measurement is not None:
+        config["measurement"] = args.measurement
+
+    # Auto-build output dir from config when not explicitly provided
+    if args.output_dir is None:
+        if config.get("use_classical", False):
+            config["output_dir"] = "runs/patternnet_classical"
+        else:
+            abbrev = {"dense": "d", "rx": "rx", "ry": "ry", "rz": "rz"}
+            enc = abbrev.get(config["encoding"], config["encoding"])
+            ans = abbrev.get(config["ansatz"], config["ansatz"])
+            meas = config["measurement"]
+            config["output_dir"] = f"runs/patternnet_{enc}_{ans}_{meas}"
+    else:
+        config["output_dir"] = args.output_dir
+
     return config
-
-
-def set_seed(seed):
-    """Set all random seeds for reproducibility."""
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True, warn_only=True)
-
-
-def seed_worker(worker_id, base_seed):
-    """Seed Python and NumPy RNGs in each DataLoader worker."""
-    worker_seed = (base_seed + worker_id) % 2**32
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
 
 
 def split_indices_by_class(targets, config):
@@ -427,42 +451,12 @@ def build_model(config, device):
     model = MultiClassQCNN(
         num_classes=config["num_classes"],
         encoding=config["encoding"],
-        ansatz=DenseQCNNAnsatz4NoPool(),
+        ansatz=build_ansatz(config),
         readout_wires=[0, 1, 2, 3],
         measurement=config["measurement"],
         use_gpu=(device.type == "cuda"),
     )
     return model.to(device)
-
-
-def setup_logger(output_dir: str) -> logging.Logger:
-    """Create a logger that writes to both a file and stdout."""
-    os.makedirs(output_dir, exist_ok=True)
-    logger = logging.getLogger(f"train_patternnet.{id(output_dir)}")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-    file_handler = logging.FileHandler(os.path.join(output_dir, "training.log"))
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-    return logger
-
-
-def save_confusion_matrix(output_dir: str, confusion_matrix, class_labels) -> str:
-    """Save a labeled confusion matrix CSV and return its path."""
-    import csv
-
-    path = os.path.join(output_dir, "confusion_matrix_best.csv")
-    with open(path, "w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(["", *class_labels])
-        for index, row in enumerate(confusion_matrix.astype(int)):
-            writer.writerow([class_labels[index], *row.tolist()])
-    return path
 
 
 def main():
@@ -492,7 +486,7 @@ def main():
         min_lr=config["scheduler_min_lr"],
     )
 
-    logger = setup_logger(config["output_dir"])
+    logger = setup_logger(config["output_dir"], logger_name="train_patternnet")
     trainer = MultiClassTrainer(
         criterion=criterion,
         device=device,

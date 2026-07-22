@@ -16,13 +16,8 @@ Usage:
     python -m src.headless.train_cifar10 --output-dir runs/cifar10_exp2 --seed 123
 """
 
-import logging
-import os
-import random
-import sys
 from functools import partial
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -30,9 +25,15 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
-from ..qml.ansatz.dense import DenseQCNNAnsatz4NoPool
 from ..qml.models.multiclass import MultiClassCNN, MultiClassQCNN
 from ..training.trainers import MultiClassTrainer
+from ..training.shared import (
+    set_seed,
+    seed_worker,
+    build_ansatz,
+    setup_logger,
+    save_confusion_matrix
+)
 
 
 CONFIG = {
@@ -44,6 +45,7 @@ CONFIG = {
     "num_classes": 10,
     "use_classical": False,
     "encoding": "dense",
+    "ansatz": "dense",
     "measurement": "z",
     # Training
     "epochs": 20,
@@ -90,13 +92,32 @@ def parse_cli_overrides():
         action="store_true",
         help="Use MultiClassCNN instead of MultiClassQCNN",
     )
+    parser.add_argument(
+        "--encoding",
+        type=str,
+        choices=["rx", "ry", "rz", "dense"],
+        default=None,
+        help="Quantum encoding strategy",
+    )
+    parser.add_argument(
+        "--ansatz",
+        type=str,
+        choices=["rx", "ry", "rz", "dense"],
+        default=None,
+        help="Dense ansatz or single-axis ansatz for the QCNN",
+    )
+    parser.add_argument(
+        "--measurement",
+        type=str,
+        choices=["x", "y", "z"],
+        default=None,
+        help="Measurement axis",
+    )
     args = parser.parse_args()
 
     config = CONFIG.copy()
     if args.data_root is not None:
         config["data_root"] = args.data_root
-    if args.output_dir is not None:
-        config["output_dir"] = args.output_dir
     if args.seed is not None:
         config["seed"] = args.seed
     if args.limit_samples is not None:
@@ -111,27 +132,27 @@ def parse_cli_overrides():
         config["num_workers"] = args.num_workers
     if args.use_classical:
         config["use_classical"] = True
+    if args.encoding is not None:
+        config["encoding"] = args.encoding
+    if args.ansatz is not None:
+        config["ansatz"] = args.ansatz
+    if args.measurement is not None:
+        config["measurement"] = args.measurement
+
+    # Auto-build output dir from config when not explicitly provided
+    if args.output_dir is None:
+        if config.get("use_classical", False):
+            config["output_dir"] = "runs/cifar10_classical"
+        else:
+            abbrev = {"dense": "d", "rx": "rx", "ry": "ry", "rz": "rz"}
+            enc = abbrev.get(config["encoding"], config["encoding"])
+            ans = abbrev.get(config["ansatz"], config["ansatz"])
+            meas = config["measurement"]
+            config["output_dir"] = f"runs/cifar10_{enc}_{ans}_{meas}"
+    else:
+        config["output_dir"] = args.output_dir
+
     return config
-
-
-def set_seed(seed):
-    """Set all random seeds for reproducibility."""
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True, warn_only=True)
-
-
-def seed_worker(worker_id, base_seed):
-    """Seed Python and NumPy RNGs in each DataLoader worker."""
-    worker_seed = (base_seed + worker_id) % 2**32
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
 
 
 def load_data(config, use_cuda: bool):
@@ -233,56 +254,12 @@ def build_model(config, device):
     model = MultiClassQCNN(
         num_classes=config["num_classes"],
         encoding=config["encoding"],
-        ansatz=DenseQCNNAnsatz4NoPool(),
+        ansatz=build_ansatz(config),
         readout_wires=[0, 1, 2, 3],
         measurement=config["measurement"],
         use_gpu=(device.type == "cuda"),
     )
     return model.to(device)
-
-
-def setup_logger(output_dir: str) -> logging.Logger:
-    """Create a logger that writes to both a file and stdout."""
-    import os
-
-    os.makedirs(output_dir, exist_ok=True)
-    logger = logging.getLogger(f"train_cifar10.{id(output_dir)}")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-    fh = logging.FileHandler(os.path.join(output_dir, "training.log"))
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-    return logger
-
-
-def save_confusion_matrix(
-    output_dir: str,
-    confusion_matrix: np.ndarray,
-    class_labels=None,
-) -> str:
-    """Save a labeled confusion matrix CSV and return its path."""
-    import csv
-    import os
-
-    path = os.path.join(output_dir, "confusion_matrix_best.csv")
-    if class_labels is None:
-        class_labels = [str(i) for i in range(confusion_matrix.shape[0])]
-    else:
-        class_labels = [str(label) for label in class_labels]
-
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["", *class_labels])
-        for idx, row in enumerate(confusion_matrix.astype(int)):
-            writer.writerow([class_labels[idx], *row.tolist()])
-
-    return path
 
 
 def main():
@@ -314,7 +291,7 @@ def main():
     )
 
     # Logger + trainer
-    logger = setup_logger(config["output_dir"])
+    logger = setup_logger(config["output_dir"], logger_name="train_cifar10")
     trainer = MultiClassTrainer(
         criterion=criterion,
         device=device,
