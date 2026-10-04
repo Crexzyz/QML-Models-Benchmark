@@ -21,15 +21,22 @@ class BaseTrainer(ABC):
     """
 
     _CSV_FIELDS = [
-        "epoch", "train_loss", "train_acc", "test_loss", "test_acc",
+        "epoch", "train_loss", "train_acc", "val_loss", "val_acc",
+        "test_loss", "test_acc",
         "precision", "recall", "f1", "micro_f1", "macro_f1",
-        "train_correct", "train_total", "test_correct", "test_total",
+        "balanced_accuracy",
+        "train_correct", "train_total", "val_correct", "val_total",
+        "test_correct", "test_total",
         "per_class_precision", "per_class_recall", "per_class_f1",
+        "per_class_support",
         "epoch_time_s", "lr_before_scheduler", "lr", "scheduler_reduced_lr",
         "gpu_peak_memory_allocated_bytes",
         "train_quantum_forward_calls", "train_quantum_circuit_executions",
         "train_quantum_patches",
         "train_quantum_layer_forward_time_s", "train_quantum_circuit_time_s",
+        "val_quantum_forward_calls", "val_quantum_circuit_executions",
+        "val_quantum_patches",
+        "val_quantum_layer_forward_time_s", "val_quantum_circuit_time_s",
         "test_quantum_forward_calls", "test_quantum_circuit_executions",
         "test_quantum_patches",
         "test_quantum_layer_forward_time_s", "test_quantum_circuit_time_s",
@@ -146,11 +153,15 @@ class BaseTrainer(ABC):
             return
 
         final_metrics = epoch_records[-1]
+        metric_phase = (
+            "val" if "val_acc" in final_metrics else "test"
+        )
         test_records = [
-            record for record in epoch_records if record["test_acc"] is not None
+            record for record in epoch_records
+            if record.get(f"{metric_phase}_acc") is not None
         ]
         best_metrics = (
-            max(test_records, key=lambda record: record["test_acc"])
+            max(test_records, key=lambda record: record[f"{metric_phase}_acc"])
             if test_records
             else None
         )
@@ -169,7 +180,7 @@ class BaseTrainer(ABC):
             "final": final_metrics,
         }
         quantum_cost = {}
-        for phase in ("train", "test"):
+        for phase in ("train", metric_phase):
             total_patches = sum(
                 record[f"{phase}_quantum_patches"] for record in epoch_records
             )
@@ -217,23 +228,31 @@ class BaseTrainer(ABC):
             }
         summary["quantum_cost"] = quantum_cost
         if best_metrics is not None:
-            min_loss_metrics = min(
-                test_records, key=lambda record: record["test_loss"]
+            summary["best_validation" if metric_phase == "val" else "best_test"] = (
+                best_metrics
             )
-            summary["best_validation"] = best_metrics
             summary["best_epoch"] = best_metrics["epoch"]
             summary["time_to_best_epoch_s"] = sum(
                 record["epoch_time_s"]
                 for record in epoch_records[:best_metrics["epoch"]]
             )
             summary["final_generalization_gap"] = (
-                final_metrics["train_acc"] - final_metrics["test_acc"]
+                final_metrics["train_acc"]
+                - final_metrics[f"{metric_phase}_acc"]
             )
             summary["best_generalization_gap"] = (
-                best_metrics["train_acc"] - best_metrics["test_acc"]
+                best_metrics["train_acc"]
+                - best_metrics[f"{metric_phase}_acc"]
             )
-            summary["minimum_test_loss"] = min_loss_metrics["test_loss"]
-            summary["minimum_test_loss_epoch"] = min_loss_metrics["epoch"]
+            minimum_loss_metrics = min(
+                test_records, key=lambda record: record[f"{metric_phase}_loss"]
+            )
+            summary[f"minimum_{metric_phase}_loss"] = minimum_loss_metrics[
+                f"{metric_phase}_loss"
+            ]
+            summary[f"minimum_{metric_phase}_loss_epoch"] = (
+                minimum_loss_metrics["epoch"]
+            )
 
         path = os.path.join(self.output_dir, "summary.json")
         with open(path, "w") as f:
@@ -288,7 +307,14 @@ class BaseTrainer(ABC):
         return {}
 
     def train(
-        self, model, train_loader, optimizer, epochs, test_loader=None, scheduler=None
+        self,
+        model,
+        train_loader,
+        optimizer,
+        epochs,
+        test_loader=None,
+        scheduler=None,
+        validation_loader=None,
     ) -> dict[str, list]:
         """
         Train the given model using the provided data loader and optimizer.
@@ -298,15 +324,23 @@ class BaseTrainer(ABC):
             train_loader: An iterable that provides batches of training data.
             optimizer: The optimization algorithm to update model parameters.
             epochs: The number of epochs to train the model.
-            test_loader: An optional iterable that provides batches of test data.
+            test_loader: Legacy evaluation-loader argument.
             scheduler: An optional learning rate scheduler.
+            validation_loader: Validation data used for checkpoint selection and
+                               scheduler decisions.
         """
+        if test_loader is not None and validation_loader is not None:
+            raise ValueError("Pass either test_loader or validation_loader, not both")
+        evaluation_loader = (
+            validation_loader if validation_loader is not None else test_loader
+        )
+        metric_phase = "val" if validation_loader is not None else "test"
         model.to(self.device)
         train_losses = []
         train_accuracies = []
         test_losses = []
         test_accuracies = []
-        best_test_acc = 0.0
+        best_eval_acc = -1.0
         epoch_records = []
 
         self._report_epoch(f"Starting training for {epochs} epochs")
@@ -376,9 +410,9 @@ class BaseTrainer(ABC):
             # Run evaluation if test_loader provided
             test_loss = test_acc = None
             test_metrics: dict = {}
-            if test_loader is not None:
+            if evaluation_loader is not None:
                 self._reset_quantum_cost_metrics(model)
-                test_metrics, _ = self.evaluate(model, test_loader)
+                test_metrics, _ = self.evaluate(model, evaluation_loader)
                 test_quantum_metrics = self._collect_quantum_cost_metrics(model)
                 test_loss = test_metrics["loss"]
                 test_acc = test_metrics["acc"]
@@ -395,7 +429,10 @@ class BaseTrainer(ABC):
                 self._report_epoch(
                     f"Epoch {epoch}: Train Loss={epoch_train_loss:.4f}, "
                     f"Train Acc={epoch_train_acc:.4f} | "
-                    f"Test Loss={test_loss:.4f}, Test Acc={test_acc:.4f}{extra}"
+                    f"{'Validation' if metric_phase == 'val' else 'Test'} "
+                    f"Loss={test_loss:.4f}, "
+                    f"{'Validation' if metric_phase == 'val' else 'Test'} "
+                    f"Acc={test_acc:.4f}{extra}"
                 )
                 if "per_class_f1" in test_metrics:
                     per_class = [f'{v:.4f}' for v in test_metrics['per_class_f1']]
@@ -441,16 +478,16 @@ class BaseTrainer(ABC):
                     "epoch": epoch,
                     "train_loss": f"{epoch_train_loss:.6f}",
                     "train_acc": f"{epoch_train_acc:.6f}",
-                    "test_loss": (
+                    f"{metric_phase}_loss": (
                         f"{test_loss:.6f}" if test_loss is not None else ""
                     ),
-                    "test_acc": (
+                    f"{metric_phase}_acc": (
                         f"{test_acc:.6f}" if test_acc is not None else ""
                     ),
                     "train_correct": correct,
                     "train_total": total,
-                    "test_correct": test_metrics.get("correct", ""),
-                    "test_total": test_metrics.get("total", ""),
+                    f"{metric_phase}_correct": test_metrics.get("correct", ""),
+                    f"{metric_phase}_total": test_metrics.get("total", ""),
                     "per_class_precision": json.dumps(
                         test_metrics.get("per_class_precision", [])
                     ),
@@ -460,6 +497,9 @@ class BaseTrainer(ABC):
                     "per_class_f1": json.dumps(
                         test_metrics.get("per_class_f1", [])
                     ),
+                    "per_class_support": json.dumps(
+                        test_metrics.get("per_class_support", [])
+                    ),
                     "epoch_time_s": f"{epoch_time:.1f}",
                     "lr_before_scheduler": f"{lr_before_scheduler:.6f}",
                     "lr": f"{current_lr:.6f}",
@@ -468,7 +508,7 @@ class BaseTrainer(ABC):
                 }
                 for phase, quantum_metrics in (
                     ("train", train_quantum_metrics),
-                    ("test", test_quantum_metrics),
+                    (metric_phase, test_quantum_metrics),
                 ):
                     csv_row.update({
                         f"{phase}_quantum_forward_calls": (
@@ -485,7 +525,10 @@ class BaseTrainer(ABC):
                             f"{quantum_metrics['circuit_time_s']:.6f}"
                         ),
                     })
-                for field in ("precision", "recall", "f1", "micro_f1", "macro_f1"):
+                for field in (
+                    "precision", "recall", "f1", "micro_f1", "macro_f1",
+                    "balanced_accuracy",
+                ):
                     if field in test_metrics:
                         csv_row[field] = f"{test_metrics[field]:.6f}"
                 self._log_csv(csv_row)
@@ -496,10 +539,6 @@ class BaseTrainer(ABC):
                     "train_acc": epoch_train_acc,
                     "train_correct": correct,
                     "train_total": total,
-                    "test_loss": test_loss,
-                    "test_acc": test_acc,
-                    "test_correct": test_metrics.get("correct"),
-                    "test_total": test_metrics.get("total"),
                     "macro_f1": test_metrics.get("macro_f1"),
                     "micro_f1": test_metrics.get("micro_f1"),
                     "epoch_time_s": epoch_time,
@@ -508,9 +547,15 @@ class BaseTrainer(ABC):
                     "scheduler_reduced_lr": scheduler_reduced_lr,
                     "gpu_peak_memory_allocated_bytes": peak_memory or None,
                 }
+                epoch_record.update({
+                    f"{metric_phase}_loss": test_loss,
+                    f"{metric_phase}_acc": test_acc,
+                    f"{metric_phase}_correct": test_metrics.get("correct"),
+                    f"{metric_phase}_total": test_metrics.get("total"),
+                })
                 for phase, quantum_metrics in (
                     ("train", train_quantum_metrics),
-                    ("test", test_quantum_metrics),
+                    (metric_phase, test_quantum_metrics),
                 ):
                     for field, value in quantum_metrics.items():
                         epoch_record[f"{phase}_quantum_{field}"] = value
@@ -522,13 +567,13 @@ class BaseTrainer(ABC):
                     )
                     self._report_epoch(f"Checkpoint saved: {ckpt}")
 
-                if test_acc is not None and test_acc > best_test_acc:
-                    best_test_acc = test_acc
+                if test_acc is not None and test_acc > best_eval_acc:
+                    best_eval_acc = test_acc
                     self._save_checkpoint(
                         epoch, model, optimizer, csv_row, "best_model.pt",
                     )
                     self._report_epoch(
-                        f"New best model (acc={test_acc:.4f}) "
+                        f"New best {metric_phase} model (acc={test_acc:.4f}) "
                         f"saved to best_model.pt"
                     )
 
@@ -542,7 +587,7 @@ class BaseTrainer(ABC):
                     epochs, model, optimizer, csv_row, "final_model.pt",
                 )
             self._report_epoch(
-                f"Training complete. Best test acc: {best_test_acc:.4f}"
+                f"Training complete. Best {metric_phase} acc: {best_eval_acc:.4f}"
             )
             self._save_summary(epoch_records)
             self._report_epoch(f"All outputs saved to: {self.output_dir}")
@@ -553,9 +598,9 @@ class BaseTrainer(ABC):
             "train_acc": train_accuracies,
         }
 
-        if test_loader is not None:
-            result["test_loss"] = test_losses
-            result["test_acc"] = test_accuracies
+        if evaluation_loader is not None:
+            result[f"{metric_phase}_loss"] = test_losses
+            result[f"{metric_phase}_acc"] = test_accuracies
 
         return result
 

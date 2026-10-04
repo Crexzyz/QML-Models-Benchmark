@@ -1,28 +1,35 @@
 """
 Headless training script for CIFAR-10 multiclass classification with Quantum CNN.
 Designed for queue-based HPC systems (SLURM, PBS, etc.).
+All available examples, including the published test partition, are reshuffled
+into this benchmark's reproducible stratified 80/10/10 split.
 
 Outputs:
     <output_dir>/
-        metrics.csv          - Per-epoch train/test loss and accuracy
+        metrics.csv          - Per-epoch train/validation loss and accuracy
         training.log         - Detailed log with timestamps
         checkpoint_epoch_N.pt - Model checkpoint per epoch
-        best_model.pt        - Best model by test accuracy
+        best_model.pt        - Best model by validation accuracy
         final_model.pt       - Final model state dict
         config.json          - Full training configuration for reproducibility
+        split_manifest.json  - Fixed stratified 80/10/10 sample indices
+        test_metrics.json    - Final held-out test metrics for best validation model
 
 Usage:
     python -m src.headless.train_cifar10
     python -m src.headless.train_cifar10 --output-dir runs/cifar10_exp2 --seed 123
 """
 
+import json
+import os
 from functools import partial
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torchvision import datasets, transforms
 
 from ..qml.models.multiclass import MultiClassCNN, MultiClassQCNN
@@ -32,7 +39,11 @@ from ..training.shared import (
     seed_worker,
     build_ansatz,
     setup_logger,
-    save_confusion_matrix
+    save_confusion_matrix,
+    save_test_metrics,
+    stratified_split_indices,
+    limit_split_indices,
+    split_class_counts,
 )
 
 
@@ -41,6 +52,7 @@ CONFIG = {
     "data_root": "src/data/cifar10",
     "image_size": 32,
     "limit_samples": None,
+    "split_fractions": (0.8, 0.1, 0.1),
     # Model
     "num_classes": 10,
     "use_classical": False,
@@ -156,7 +168,7 @@ def parse_cli_overrides():
 
 
 def load_data(config, use_cuda: bool):
-    """Load and prepare CIFAR-10 train/test datasets."""
+    """Load CIFAR-10 and make a fixed stratified 80/10/10 split."""
     cifar10_mean = (0.4914, 0.4822, 0.4465)
     cifar10_std = (0.2023, 0.1994, 0.2010)
 
@@ -182,34 +194,48 @@ def load_data(config, use_cuda: bool):
         transforms.Normalize(cifar10_mean, cifar10_std),
     ])
 
-    train_dataset_full = datasets.CIFAR10(
+    train_source = datasets.CIFAR10(
         root=config["data_root"], train=True, download=True, transform=train_transform
     )
-    test_dataset_full = datasets.CIFAR10(
+    test_source = datasets.CIFAR10(
         root=config["data_root"], train=False, download=True, transform=test_transform
     )
-
+    augmented_full_dataset = ConcatDataset([train_source, datasets.CIFAR10(
+        root=config["data_root"], train=False, download=True,
+        transform=train_transform,
+    )])
+    evaluation_full_dataset = ConcatDataset([
+        datasets.CIFAR10(
+            root=config["data_root"], train=True, download=True,
+            transform=test_transform,
+        ),
+        test_source,
+    ])
+    targets = np.asarray(train_source.targets + test_source.targets)
+    train_indices, val_indices, test_indices = stratified_split_indices(
+        targets, config["seed"], config["split_fractions"]
+    )
     limit = config["limit_samples"]
-    subset_generator = torch.Generator().manual_seed(config["seed"])
     if limit is not None:
-        train_count = min(limit, len(train_dataset_full))
-        test_count = min(max(limit // 5, 1), len(test_dataset_full))
-        train_indices = torch.randperm(
-            len(train_dataset_full), generator=subset_generator
-        )[:train_count]
-        test_indices = torch.randperm(
-            len(test_dataset_full), generator=subset_generator
-        )[:test_count]
-        train_dataset = Subset(train_dataset_full, train_indices.tolist())
-        test_dataset = Subset(test_dataset_full, test_indices.tolist())
-    else:
-        train_dataset = train_dataset_full
-        test_dataset = test_dataset_full
+        val_test_limit = max(round(limit * 0.125), 1)
+        train_indices = limit_split_indices(
+            train_indices, targets, limit, config["seed"] + 1
+        )
+        val_indices = limit_split_indices(
+            val_indices, targets, val_test_limit, config["seed"] + 2
+        )
+        test_indices = limit_split_indices(
+            test_indices, targets, val_test_limit, config["seed"] + 3
+        )
+    train_dataset = Subset(augmented_full_dataset, train_indices)
+    val_dataset = Subset(evaluation_full_dataset, val_indices)
+    test_dataset = Subset(evaluation_full_dataset, test_indices)
 
     pin_memory = use_cuda
     persistent_workers = config["num_workers"] > 0
     train_generator = torch.Generator().manual_seed(config["seed"])
-    test_generator = torch.Generator().manual_seed(config["seed"] + 1)
+    val_generator = torch.Generator().manual_seed(config["seed"] + 1)
+    test_generator = torch.Generator().manual_seed(config["seed"] + 2)
     worker_init_fn = partial(seed_worker, base_seed=config["seed"])
 
     train_loader = DataLoader(
@@ -222,6 +248,16 @@ def load_data(config, use_cuda: bool):
         worker_init_fn=worker_init_fn,
         generator=train_generator,
     )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        worker_init_fn=worker_init_fn,
+        generator=val_generator,
+    )
     test_loader = DataLoader(
         test_dataset,
         batch_size=config["batch_size"],
@@ -233,14 +269,36 @@ def load_data(config, use_cuda: bool):
         generator=test_generator,
     )
 
-    classes = train_dataset_full.classes
+    classes = train_source.classes
+    manifest = {
+        "dataset": "CIFAR-10",
+        "seed": config["seed"],
+        "fractions": config["split_fractions"],
+        "total_samples": len(evaluation_full_dataset),
+        "train_indices": train_indices,
+        "validation_indices": val_indices,
+        "test_indices": test_indices,
+        "class_counts": split_class_counts(
+            targets,
+            {
+                "train": train_indices,
+                "validation": val_indices,
+                "test": test_indices,
+            },
+            classes,
+        ),
+        "is_smoke_test": limit is not None,
+    }
     return (
         train_loader,
+        val_loader,
         test_loader,
         len(train_dataset),
+        len(val_dataset),
         len(test_dataset),
         len(classes),
         classes,
+        manifest,
     )
 
 
@@ -268,9 +326,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Data
-    train_loader, test_loader, n_train, n_test, num_classes, classes = load_data(
-        config, use_cuda=(device.type == "cuda")
-    )
+    (
+        train_loader, val_loader, test_loader, n_train, n_val, n_test,
+        num_classes, classes, split_manifest,
+    ) = load_data(config, use_cuda=(device.type == "cuda"))
 
     # Model
     model = build_model(config, device)
@@ -281,7 +340,7 @@ def main():
         model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
     )
 
-    # Learning rate scheduler: reduce LR when validation/test loss plateaus.
+    # Learning rate scheduler monitors validation loss.
     scheduler = ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -306,8 +365,18 @@ def main():
     config["device"] = str(device)
     config["num_classes"] = num_classes
     config["classes"] = classes
+    config["split_fractions"] = list(config["split_fractions"])
     trainer.save_config(config)
-    logger.info(f"Train samples: {n_train}, Test samples: {n_test}")
+    with open(
+        os.path.join(config["output_dir"], "split_manifest.json"),
+        "w",
+        encoding="utf-8",
+    ) as manifest_file:
+        json.dump(split_manifest, manifest_file, indent=2)
+    logger.info(
+        f"Train samples: {n_train}, Validation samples: {n_val}, "
+        f"Test samples: {n_test}"
+    )
     if num_classes > 5:
         logger.info(f"Classes ({num_classes}): {classes[:5]}...")
     else:
@@ -325,30 +394,42 @@ def main():
         train_loader=train_loader,
         optimizer=optimizer,
         epochs=config["epochs"],
-        test_loader=test_loader,
+        validation_loader=val_loader,
         scheduler=scheduler,
     )
 
     # Evaluate and export confusion matrix for the best checkpoint.
-    import os
-
     best_model_path = os.path.join(config["output_dir"], "best_model.pt")
-    if os.path.exists(best_model_path):
-        checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        logger.info(f"Loaded best model from {best_model_path}")
-    else:
-        logger.info("best_model.pt not found; using final model for evaluation")
+    if not os.path.exists(best_model_path):
+        raise FileNotFoundError(
+            f"Validation-selected checkpoint not found: {best_model_path}"
+        )
+    checkpoint = torch.load(best_model_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    logger.info(f"Loaded best validation model from {best_model_path}")
 
-    best_metrics, confusion_matrix = trainer.evaluate(model, test_loader)
+    test_metrics, confusion_matrix = trainer.evaluate(model, test_loader)
     cm_path = save_confusion_matrix(
         config["output_dir"],
         confusion_matrix,
         classes,
     )
+    save_test_metrics(
+        config["output_dir"],
+        test_metrics,
+        {
+            "selected_epoch": checkpoint["epoch"],
+            "validation_accuracy": checkpoint["metrics"]["val_acc"],
+            "selection_metric": "validation_accuracy",
+            "seed": config["seed"],
+            "split_fractions": config["split_fractions"],
+            "dataset": "CIFAR-10",
+            "config": config,
+        },
+    )
     logger.info(
-        "Best Test | "
-        f"Loss={best_metrics['loss']:.4f}, Acc={best_metrics['acc']:.4f}"
+        "Final Test | "
+        f"Loss={test_metrics['loss']:.4f}, Acc={test_metrics['acc']:.4f}"
     )
     logger.info(f"Confusion matrix saved to {cm_path}")
 

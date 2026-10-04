@@ -7,7 +7,7 @@ PatternNet must be extracted into class-named folders, for example:
     src/data/patternnet/baseball_field/*.jpg
 
 The dataset has no official train/validation/test split, so this script creates
-a reproducible stratified 70%/15%/15% split for every class.
+a reproducible stratified 80%/10%/10% split for every class.
 
 Outputs:
     <output_dir>/
@@ -17,6 +17,8 @@ Outputs:
         best_model.pt                - Best model by validation accuracy
         final_model.pt               - Final model state dict
         config.json                  - Full training configuration
+        split_manifest.json         - Fixed stratified 80/10/10 sample indices
+        test_metrics.json           - Final test metrics for best validation model
         confusion_matrix_best.csv    - Test confusion matrix of best model
 
 Usage:
@@ -24,6 +26,7 @@ Usage:
     python -m src.headless.train_patternnet --data-root data/PatternNet
 """
 
+import json
 import os
 from functools import partial
 
@@ -43,7 +46,11 @@ from ..training.shared import (
     seed_worker,
     build_ansatz,
     setup_logger,
-    save_confusion_matrix
+    save_confusion_matrix,
+    save_test_metrics,
+    stratified_split_indices,
+    limit_split_indices,
+    split_class_counts,
 )
 
 
@@ -57,8 +64,7 @@ CONFIG = {
     # Data
     "data_root": "src/data/patternnet",
     "image_size": 64,
-    "train_fraction": 0.70,
-    "val_fraction": 0.15,
+    "split_fractions": (0.8, 0.1, 0.1),
     "limit_samples": None,
     # Model
     "num_classes": 38,
@@ -320,36 +326,9 @@ def parse_cli_overrides():
 
 def split_indices_by_class(targets, config):
     """Create deterministic, stratified train/validation/test indices."""
-    targets = np.asarray(targets)
-    rng = np.random.default_rng(config["seed"])
-    train_indices, val_indices, test_indices = [], [], []
-
-    for class_index in np.unique(targets):
-        class_indices = np.flatnonzero(targets == class_index)
-        rng.shuffle(class_indices)
-        count = len(class_indices)
-        train_count = int(count * config["train_fraction"])
-        val_count = int(count * config["val_fraction"])
-        test_count = count - train_count - val_count
-        if min(train_count, val_count, test_count) < 1:
-            raise ValueError(
-                "Each PatternNet class needs enough samples for train, "
-                "validation, and test splits."
-            )
-        train_indices.extend(class_indices[:train_count].tolist())
-        val_indices.extend(class_indices[train_count:train_count + val_count].tolist())
-        test_indices.extend(class_indices[train_count + val_count:].tolist())
-
-    return train_indices, val_indices, test_indices
-
-
-def limit_split_indices(indices, limit, seed):
-    """Deterministically limit a split while preserving reproducible ordering."""
-    if limit is None or len(indices) <= limit:
-        return indices
-    generator = torch.Generator().manual_seed(seed)
-    selected = torch.randperm(len(indices), generator=generator)[:limit].tolist()
-    return [indices[index] for index in selected]
+    return stratified_split_indices(
+        targets, config["seed"], config["split_fractions"]
+    )
 
 
 def load_data(config, use_cuda: bool):
@@ -396,13 +375,16 @@ def load_data(config, use_cuda: bool):
     )
     limit = config["limit_samples"]
     if limit is not None:
-        train_indices = limit_split_indices(train_indices, limit, config["seed"])
-        evaluation_limit = max(limit // 5, 1)
+        targets = np.asarray(train_dataset_full.targets)
+        evaluation_limit = max(round(limit * 0.125), 1)
+        train_indices = limit_split_indices(
+            train_indices, targets, limit, config["seed"] + 1
+        )
         val_indices = limit_split_indices(
-            val_indices, evaluation_limit, config["seed"] + 1
+            val_indices, targets, evaluation_limit, config["seed"] + 2
         )
         test_indices = limit_split_indices(
-            test_indices, evaluation_limit, config["seed"] + 2
+            test_indices, targets, evaluation_limit, config["seed"] + 3
         )
 
     train_dataset = Subset(train_dataset_full, train_indices)
@@ -440,6 +422,25 @@ def load_data(config, use_cuda: bool):
         len(val_dataset),
         len(test_dataset),
         train_dataset_full.classes,
+        {
+            "dataset": "PatternNet",
+            "seed": config["seed"],
+            "fractions": config["split_fractions"],
+            "total_samples": len(train_dataset_full),
+            "train_indices": train_indices,
+            "validation_indices": val_indices,
+            "test_indices": test_indices,
+            "class_counts": split_class_counts(
+                np.asarray(train_dataset_full.targets),
+                {
+                    "train": train_indices,
+                    "validation": val_indices,
+                    "test": test_indices,
+                },
+                train_dataset_full.classes,
+            ),
+            "is_smoke_test": limit is not None,
+        },
     )
 
 
@@ -472,6 +473,7 @@ def main():
         n_val,
         n_test,
         classes,
+        split_manifest,
     ) = load_data(config, use_cuda=(device.type == "cuda"))
     model = build_model(config, device)
     criterion = nn.CrossEntropyLoss(label_smoothing=config["label_smoothing"])
@@ -498,7 +500,14 @@ def main():
     )
     config["device"] = str(device)
     config["classes"] = classes
+    config["split_fractions"] = list(config["split_fractions"])
     trainer.save_config(config)
+    with open(
+        os.path.join(config["output_dir"], "split_manifest.json"),
+        "w",
+        encoding="utf-8",
+    ) as manifest_file:
+        json.dump(split_manifest, manifest_file, indent=2)
     logger.info(
         f"Train samples: {n_train}, Val samples: {n_val}, Test samples: {n_test}"
     )
@@ -516,21 +525,35 @@ def main():
         train_loader=train_loader,
         optimizer=optimizer,
         epochs=config["epochs"],
-        test_loader=val_loader,
+        validation_loader=val_loader,
         scheduler=scheduler,
     )
 
     best_model_path = os.path.join(config["output_dir"], "best_model.pt")
-    if os.path.exists(best_model_path):
-        checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        logger.info(f"Loaded best validation model from {best_model_path}")
-    else:
-        logger.info("best_model.pt not found; using final model for evaluation")
+    if not os.path.exists(best_model_path):
+        raise FileNotFoundError(
+            f"Validation-selected checkpoint not found: {best_model_path}"
+        )
+    checkpoint = torch.load(best_model_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    logger.info(f"Loaded best validation model from {best_model_path}")
 
     test_metrics, confusion_matrix = trainer.evaluate(model, test_loader)
     confusion_matrix_path = save_confusion_matrix(
         config["output_dir"], confusion_matrix, classes
+    )
+    save_test_metrics(
+        config["output_dir"],
+        test_metrics,
+        {
+            "selected_epoch": checkpoint["epoch"],
+            "validation_accuracy": checkpoint["metrics"]["val_acc"],
+            "selection_metric": "validation_accuracy",
+            "seed": config["seed"],
+            "split_fractions": config["split_fractions"],
+            "dataset": "PatternNet",
+            "config": config,
+        },
     )
     logger.info(
         "Final Test | "

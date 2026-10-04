@@ -5,13 +5,14 @@ Designed for queue-based HPC systems (SLURM, PBS, etc.).
 
 Outputs:
     <output_dir>/
-        metrics.csv          - Per-epoch metrics (legacy test_* columns)
+        metrics.csv          - Per-epoch train/validation metrics
         training.log         - Detailed log with timestamps
         checkpoint_epoch_N.pt - Model checkpoint per epoch
         best_model.pt        - Best model by validation accuracy
         final_model.pt       - Final model state dict
         config.json          - Full training configuration for reproducibility
-        validation_split.json - Source-level train/validation split summary
+        split_manifest.json  - Source-level stratified 80/10/10 split
+        test_metrics.json    - Final held-out test metrics for best validation model
 
 Usage:
     python -m src.headless.train_junk_food
@@ -23,6 +24,7 @@ import os
 from collections import defaultdict
 from functools import partial
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -39,6 +41,9 @@ from ..training.shared import (
     seed_worker,
     set_seed,
     setup_logger,
+    stratified_split_indices,
+    limit_split_indices,
+    save_test_metrics,
 )
 
 
@@ -46,8 +51,7 @@ CONFIG = {
     # Data
     "train_data": "src/data/data_aug",
     "validation_data": "src/data/data_noaug",
-    "validation_fraction": 0.20,
-    "split_seed": 42,
+    "split_fractions": (0.8, 0.1, 0.1),
     "image_size": 64,
     "limit_samples": None,
     # Model
@@ -86,15 +90,13 @@ def parse_cli_overrides():
                         help="Junk food training directory")
     parser.add_argument("--validation-data", "--test-data", dest="validation_data",
                         type=str, default=None,
-                        help="Junk food validation directory")
+                        help="Directory containing the original labeled images")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output directory")
     parser.add_argument("--seed", type=int, default=None,
                         help="Override random seed")
-    parser.add_argument("--split-seed", type=int, default=None,
-                        help="Override the fixed source-level split seed")
     parser.add_argument("--limit-samples", type=int, default=None,
-                        help="Limit training examples and validation proportionally")
+                        help="Limit each split by source count for smoke tests")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of epochs")
     parser.add_argument("--image-size", type=int, default=None,
@@ -135,7 +137,6 @@ def parse_cli_overrides():
     for key in (
         "train_data",
         "validation_data",
-        "split_seed",
         "seed",
         "limit_samples",
         "epochs",
@@ -182,11 +183,7 @@ def _source_key(file_name: str) -> str:
 
 
 def _make_source_level_split(augmented_dataset, original_dataset, config):
-    """Keep each original image and all its augmented variants in one split."""
-    validation_fraction = config["validation_fraction"]
-    if not 0 < validation_fraction < 1:
-        raise ValueError("validation_fraction must be between 0 and 1")
-
+    """Stratify original sources; keep all augmented variants in training only."""
     original_indices_by_source = defaultdict(list)
     original_labels_by_source = {}
     for index, image in enumerate(original_dataset.images):
@@ -218,44 +215,46 @@ def _make_source_level_split(augmented_dataset, original_dataset, config):
             f"example source keys: {examples}"
         )
 
-    sources_by_label = defaultdict(list)
-    for source, label in original_labels_by_source.items():
-        sources_by_label[label].append(source)
-
-    target_validation_sources = round(
-        len(original_sources) * validation_fraction
+    ordered_sources = sorted(original_sources)
+    source_targets = np.asarray(
+        [original_labels_by_source[source] for source in ordered_sources]
     )
-    quotas = {
-        label: len(sources) * validation_fraction
-        for label, sources in sources_by_label.items()
-    }
-    validation_counts = {
-        label: int(quota) for label, quota in quotas.items()
-    }
-    remaining = target_validation_sources - sum(validation_counts.values())
-    labels_by_remainder = sorted(
-        quotas,
-        key=lambda label: (
-            -(quotas[label] - validation_counts[label]),
-            label,
-        ),
-    )
-    for label in labels_by_remainder[:remaining]:
-        validation_counts[label] += 1
-
-    split_generator = torch.Generator().manual_seed(config["split_seed"])
-    validation_sources = set()
-    for label in sorted(sources_by_label):
-        sources = sources_by_label[label]
-        order = torch.randperm(
-            len(sources), generator=split_generator
-        ).tolist()
-        validation_sources.update(
-            sources[index]
-            for index in order[:validation_counts[label]]
+    train_source_indices, validation_source_indices, test_source_indices = (
+        stratified_split_indices(
+            source_targets, config["seed"], config["split_fractions"]
         )
+    )
+    source_splits = [
+        {ordered_sources[index] for index in indices}
+        for indices in (
+            train_source_indices, validation_source_indices, test_source_indices
+        )
+    ]
+    limit = config["limit_samples"]
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("limit_samples must be a positive integer")
+        split_caps = (limit, max(round(limit * 0.125), 1),
+                      max(round(limit * 0.125), 1))
+        limited_source_splits = []
+        for split_index, (source_indices, cap) in enumerate(
+            zip(
+                (train_source_indices, validation_source_indices, test_source_indices),
+                split_caps,
+            )
+        ):
+            chosen_indices = limit_split_indices(
+                source_indices,
+                source_targets,
+                cap,
+                config["seed"] + split_index + 1,
+            )
+            limited_source_splits.append(
+                {ordered_sources[index] for index in chosen_indices}
+            )
+        source_splits = limited_source_splits
 
-    training_sources = original_sources - validation_sources
+    training_sources, validation_sources, test_sources = source_splits
     train_augmented_indices = [
         index
         for source, indices in augmented_indices_by_source.items()
@@ -274,14 +273,20 @@ def _make_source_level_split(augmented_dataset, original_dataset, config):
         if source in validation_sources
         for index in indices
     ]
+    test_indices = [
+        index
+        for source, indices in original_indices_by_source.items()
+        if source in test_sources
+        for index in indices
+    ]
 
     selected_training_sources = {
         _source_key(augmented_dataset.images[index]["file_name"])
         for index in train_augmented_indices
     }
-    if selected_training_sources & validation_sources:
-        raise RuntimeError("A validation source also has augmented training data")
-    if not validation_indices or not (
+    if selected_training_sources & (validation_sources | test_sources):
+        raise RuntimeError("Validation/test source has augmented training data")
+    if not validation_indices or not test_indices or not (
         train_augmented_indices or train_original_only_indices
     ):
         raise ValueError("The source-level split produced an empty partition")
@@ -293,35 +298,47 @@ def _make_source_level_split(augmented_dataset, original_dataset, config):
         ]
     )
     validation_dataset = Subset(original_dataset, validation_indices)
+    test_dataset = Subset(original_dataset, test_indices)
     split_summary = {
         "source_key_rule": "filename prefix before '.rf.'",
-        "split_seed": config["split_seed"],
-        "validation_fraction": validation_fraction,
+        "seed": config["seed"],
+        "fractions": config["split_fractions"],
+        "is_smoke_test": config["limit_samples"] is not None,
+        "total_source_count": len(original_sources),
         "training_source_count": len(training_sources),
         "validation_source_count": len(validation_sources),
+        "test_source_count": len(test_sources),
         "training_augmented_sample_count": len(train_augmented_indices),
         "training_original_only_sample_count": len(train_original_only_indices),
         "validation_original_sample_count": len(validation_indices),
-        "training_sources_by_class": {
-            str(label): len(sources_by_label[label]) - validation_counts[label]
-            for label in sorted(sources_by_label)
-        },
-        "validation_sources_by_class": {
-            str(label): validation_counts[label]
-            for label in sorted(sources_by_label)
+        "test_original_sample_count": len(test_indices),
+        "source_class_counts": {
+            phase: {
+                str(label): sum(
+                    original_labels_by_source[source] == label
+                    for source in sources
+                )
+                for label in sorted(set(original_labels_by_source.values()))
+            }
+            for phase, sources in zip(
+                ("train", "validation", "test"),
+                (training_sources, validation_sources, test_sources),
+            )
         },
         "augmented_source_groups_with_mixed_labels": sorted(
             source
             for source, labels in augmented_labels_by_source.items()
             if len(labels) > 1
         ),
+        "training_sources": sorted(training_sources),
         "validation_sources": sorted(validation_sources),
+        "test_sources": sorted(test_sources),
     }
-    return training_dataset, validation_dataset, split_summary
+    return training_dataset, validation_dataset, test_dataset, split_summary
 
 
 def load_data(config, use_cuda: bool):
-    """Load training variants and an isolated, source-level validation split."""
+    """Load Junk Food with source-isolated 80/10/10 binary splits."""
     transform = transforms.Compose(
         [
             transforms.Resize((config["image_size"], config["image_size"])),
@@ -336,7 +353,7 @@ def load_data(config, use_cuda: bool):
         config["validation_data"], transform=transform
     )
 
-    training_dataset, validation_dataset, split_summary = (
+    training_dataset, validation_dataset, test_dataset, split_summary = (
         _make_source_level_split(
             augmented_dataset,
             original_dataset,
@@ -344,43 +361,12 @@ def load_data(config, use_cuda: bool):
         )
     )
 
-    limit = config["limit_samples"]
-    if limit is not None:
-        if limit < 1:
-            raise ValueError("limit_samples must be a positive integer")
-        subset_generator = torch.Generator().manual_seed(
-            config["split_seed"] + 1
-        )
-        train_count = min(limit, len(training_dataset))
-        validation_count = min(
-            max(
-                round(
-                    train_count
-                    * config["validation_fraction"]
-                    / (1 - config["validation_fraction"])
-                ),
-                1,
-            ),
-            len(validation_dataset),
-        )
-        training_dataset = Subset(
-            training_dataset,
-            torch.randperm(
-                len(training_dataset), generator=subset_generator
-            )[:train_count].tolist(),
-        )
-        validation_dataset = Subset(
-            validation_dataset,
-            torch.randperm(
-                len(validation_dataset), generator=subset_generator
-            )[:validation_count].tolist(),
-        )
-
     pin_memory = use_cuda
     persistent_workers = config["num_workers"] > 0
     worker_init_fn = partial(seed_worker, base_seed=config["seed"])
     train_generator = torch.Generator().manual_seed(config["seed"])
     validation_generator = torch.Generator().manual_seed(config["seed"] + 1)
+    test_generator = torch.Generator().manual_seed(config["seed"] + 2)
 
     train_loader = DataLoader(
         training_dataset,
@@ -402,13 +388,25 @@ def load_data(config, use_cuda: bool):
         worker_init_fn=worker_init_fn,
         generator=validation_generator,
     )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        worker_init_fn=worker_init_fn,
+        generator=test_generator,
+    )
 
     classes = ["no_food", "food"]
     return (
         train_loader,
         validation_loader,
+        test_loader,
         len(training_dataset),
         len(validation_dataset),
+        len(test_dataset),
         classes,
         split_summary,
     )
@@ -439,8 +437,10 @@ def main():
     (
         train_loader,
         validation_loader,
+        test_loader,
         n_train,
         n_validation,
+        n_test,
         classes,
         split_summary,
     ) = load_data(config, use_cuda=(device.type == "cuda"))
@@ -476,21 +476,23 @@ def main():
     # Save config & log setup info
     config["device"] = str(device)
     config["classes"] = classes
+    config["split_fractions"] = list(config["split_fractions"])
     trainer.save_config(config)
     with open(
-        os.path.join(config["output_dir"], "validation_split.json"),
+        os.path.join(config["output_dir"], "split_manifest.json"),
         "w",
         encoding="utf-8",
     ) as split_file:
         json.dump(split_summary, split_file, indent=2)
     logger.info(
-        f"Train samples: {n_train}, Test samples: {n_validation} "
-        "(validation split)"
+        f"Train samples: {n_train}, Validation samples: {n_validation}, "
+        f"Test samples: {n_test}"
     )
     logger.info(
         "Source-level split: "
         f"{split_summary['training_source_count']} train sources, "
-        f"{split_summary['validation_source_count']} validation sources"
+        f"{split_summary['validation_source_count']} validation sources, "
+        f"{split_summary['test_source_count']} test sources"
     )
     logger.info(f"Classes ({len(classes)}): {classes}")
 
@@ -506,28 +508,40 @@ def main():
         train_loader=train_loader,
         optimizer=optimizer,
         epochs=config["epochs"],
-        test_loader=validation_loader,
+        validation_loader=validation_loader,
         scheduler=scheduler,
     )
 
     # Evaluate and export confusion matrix for the best checkpoint.
     best_model_path = os.path.join(config["output_dir"], "best_model.pt")
-    if os.path.exists(best_model_path):
-        checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        logger.info(f"Loaded best model from {best_model_path}")
-    else:
-        logger.info("best_model.pt not found; using final model for evaluation")
+    if not os.path.exists(best_model_path):
+        raise FileNotFoundError(
+            f"Validation-selected checkpoint not found: {best_model_path}"
+        )
+    checkpoint = torch.load(best_model_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    logger.info(f"Loaded best validation model from {best_model_path}")
 
-    best_metrics, confusion_matrix = trainer.evaluate(
-        model, validation_loader
-    )
+    test_metrics, confusion_matrix = trainer.evaluate(model, test_loader)
     confusion_matrix_path = save_confusion_matrix(
         config["output_dir"], confusion_matrix, classes
     )
+    save_test_metrics(
+        config["output_dir"],
+        test_metrics,
+        {
+            "selected_epoch": checkpoint["epoch"],
+            "validation_accuracy": checkpoint["metrics"]["val_acc"],
+            "selection_metric": "validation_accuracy",
+            "seed": config["seed"],
+            "split_fractions": config["split_fractions"],
+            "dataset": "Junk Food (binary)",
+            "config": config,
+        },
+    )
     logger.info(
-        "Best Test (validation split) | "
-        f"Loss={best_metrics['loss']:.4f}, Acc={best_metrics['acc']:.4f}"
+        "Final Test | "
+        f"Loss={test_metrics['loss']:.4f}, Acc={test_metrics['acc']:.4f}"
     )
     logger.info(f"Confusion matrix saved to {confusion_matrix_path}")
 

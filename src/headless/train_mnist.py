@@ -1,27 +1,33 @@
 """
 Headless training script for MNIST multiclass classification with Quantum CNN.
 Designed for queue-based HPC systems (SLURM, PBS, etc.).
+All available examples, including the published test partition, are reshuffled
+into this benchmark's reproducible stratified 80/10/10 split.
 
 Outputs:
     <output_dir>/
-        metrics.csv          - Per-epoch train/test loss and accuracy
+        metrics.csv          - Per-epoch train/validation loss and accuracy
         training.log         - Detailed log with timestamps
         checkpoint_epoch_N.pt - Model checkpoint per epoch
-        best_model.pt        - Best model by test accuracy
+        best_model.pt        - Best model by validation accuracy
         final_model.pt       - Final model state dict
         config.json          - Full training configuration for reproducibility
+        split_manifest.json  - Fixed stratified 80/10/10 sample indices
+        test_metrics.json    - Final held-out test metrics for best validation model
 
 Usage:
     python -m src.headless.train_mnist
     python -m src.headless.train_mnist --output-dir runs/mnist_exp2 --seed 123
 """
 
+import json
+import os
 from functools import partial
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchvision import datasets, transforms
 
@@ -32,7 +38,11 @@ from ..training.shared import (
     seed_worker,
     build_ansatz,
     setup_logger,
-    save_confusion_matrix
+    save_confusion_matrix,
+    save_test_metrics,
+    stratified_split_indices,
+    limit_split_indices,
+    split_class_counts,
 )
 
 
@@ -41,6 +51,7 @@ CONFIG = {
     "data_root": "src/data/MNIST",
     "image_size": 28,
     "limit_samples": None,
+    "split_fractions": (0.8, 0.1, 0.1),
     # Model
     "num_classes": 10,
     "use_classical": False,
@@ -140,7 +151,7 @@ def parse_cli_overrides():
 
 
 def load_data(config, use_cuda: bool):
-    """Load and prepare MNIST train/test datasets."""
+    """Load MNIST and make a fixed stratified 80/10/10 split."""
     transform = transforms.Compose([
         # MultiClassQCNN expects 3 input channels.
         transforms.Grayscale(num_output_channels=3),
@@ -148,29 +159,38 @@ def load_data(config, use_cuda: bool):
         transforms.Normalize((0.1307, 0.1307, 0.1307), (0.3081, 0.3081, 0.3081)),
     ])
 
-    train_dataset_full = datasets.MNIST(
+    train_source = datasets.MNIST(
         root=config["data_root"], train=True, download=True, transform=transform
     )
-    test_dataset_full = datasets.MNIST(
+    test_source = datasets.MNIST(
         root=config["data_root"], train=False, download=True, transform=transform
     )
-
+    full_dataset = ConcatDataset([train_source, test_source])
+    targets = torch.cat([train_source.targets, test_source.targets]).numpy()
+    train_indices, val_indices, test_indices = stratified_split_indices(
+        targets, config["seed"], config["split_fractions"]
+    )
     limit = config["limit_samples"]
     if limit is not None:
-        train_dataset = Subset(
-            train_dataset_full, range(min(limit, len(train_dataset_full)))
+        val_test_limit = max(round(limit * 0.125), 1)
+        train_indices = limit_split_indices(
+            train_indices, targets, limit, config["seed"] + 1
         )
-        test_dataset = Subset(
-            test_dataset_full, range(min(limit // 5, len(test_dataset_full)))
+        val_indices = limit_split_indices(
+            val_indices, targets, val_test_limit, config["seed"] + 2
         )
-    else:
-        train_dataset = train_dataset_full
-        test_dataset = test_dataset_full
+        test_indices = limit_split_indices(
+            test_indices, targets, val_test_limit, config["seed"] + 3
+        )
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    test_dataset = Subset(full_dataset, test_indices)
 
     pin_memory = use_cuda
     persistent_workers = config["num_workers"] > 0
     train_generator = torch.Generator().manual_seed(config["seed"])
-    test_generator = torch.Generator().manual_seed(config["seed"] + 1)
+    val_generator = torch.Generator().manual_seed(config["seed"] + 1)
+    test_generator = torch.Generator().manual_seed(config["seed"] + 2)
     worker_init_fn = partial(seed_worker, base_seed=config["seed"])
 
     train_loader = DataLoader(
@@ -182,6 +202,16 @@ def load_data(config, use_cuda: bool):
         persistent_workers=persistent_workers,
         worker_init_fn=worker_init_fn,
         generator=train_generator,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        worker_init_fn=worker_init_fn,
+        generator=val_generator,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -195,7 +225,29 @@ def load_data(config, use_cuda: bool):
     )
 
     classes = [str(i) for i in range(config["num_classes"])]
-    return train_loader, test_loader, len(train_dataset), len(test_dataset), classes
+    manifest = {
+        "dataset": "MNIST",
+        "seed": config["seed"],
+        "fractions": config["split_fractions"],
+        "total_samples": len(full_dataset),
+        "train_indices": train_indices,
+        "validation_indices": val_indices,
+        "test_indices": test_indices,
+        "class_counts": split_class_counts(
+            targets,
+            {
+                "train": train_indices,
+                "validation": val_indices,
+                "test": test_indices,
+            },
+            classes,
+        ),
+        "is_smoke_test": limit is not None,
+    }
+    return (
+        train_loader, val_loader, test_loader, len(train_dataset), len(val_dataset),
+        len(test_dataset), classes, manifest
+    )
 
 
 def build_model(config, device):
@@ -222,7 +274,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Data
-    train_loader, test_loader, n_train, n_test, classes = load_data(
+    (
+        train_loader, val_loader, test_loader, n_train, n_val, n_test, classes,
+        split_manifest,
+    ) = load_data(
         config, use_cuda=(device.type == "cuda")
     )
 
@@ -235,7 +290,7 @@ def main():
         model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"]
     )
 
-    # Learning rate scheduler: reduce LR when validation/test loss plateaus.
+    # Learning rate scheduler monitors validation loss.
     scheduler = ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -258,8 +313,18 @@ def main():
 
     # Save config & log setup info
     config["device"] = str(device)
+    config["split_fractions"] = list(config["split_fractions"])
     trainer.save_config(config)
-    logger.info(f"Train samples: {n_train}, Test samples: {n_test}")
+    with open(
+        os.path.join(config["output_dir"], "split_manifest.json"),
+        "w",
+        encoding="utf-8",
+    ) as manifest_file:
+        json.dump(split_manifest, manifest_file, indent=2)
+    logger.info(
+        f"Train samples: {n_train}, Validation samples: {n_val}, "
+        f"Test samples: {n_test}"
+    )
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -273,26 +338,37 @@ def main():
         train_loader=train_loader,
         optimizer=optimizer,
         epochs=config["epochs"],
-        test_loader=test_loader,
+        validation_loader=val_loader,
         scheduler=scheduler,
     )
 
-    # Evaluate and export confusion matrix for the best checkpoint.
-    import os
-
     best_model_path = os.path.join(config["output_dir"], "best_model.pt")
-    if os.path.exists(best_model_path):
-        checkpoint = torch.load(best_model_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        logger.info(f"Loaded best model from {best_model_path}")
-    else:
-        logger.info("best_model.pt not found; using final model for evaluation")
+    if not os.path.exists(best_model_path):
+        raise FileNotFoundError(
+            f"Validation-selected checkpoint not found: {best_model_path}"
+        )
+    checkpoint = torch.load(best_model_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    logger.info(f"Loaded best validation model from {best_model_path}")
 
-    best_metrics, confusion_matrix = trainer.evaluate(model, test_loader)
+    test_metrics, confusion_matrix = trainer.evaluate(model, test_loader)
     cm_path = save_confusion_matrix(config["output_dir"], confusion_matrix, classes)
+    save_test_metrics(
+        config["output_dir"],
+        test_metrics,
+        {
+            "selected_epoch": checkpoint["epoch"],
+            "validation_accuracy": checkpoint["metrics"]["val_acc"],
+            "selection_metric": "validation_accuracy",
+            "seed": config["seed"],
+            "split_fractions": config["split_fractions"],
+            "dataset": "MNIST",
+            "config": config,
+        },
+    )
     logger.info(
-        "Best Test | "
-        f"Loss={best_metrics['loss']:.4f}, Acc={best_metrics['acc']:.4f}"
+        "Final Test | "
+        f"Loss={test_metrics['loss']:.4f}, Acc={test_metrics['acc']:.4f}"
     )
     logger.info(f"Confusion matrix saved to {cm_path}")
 

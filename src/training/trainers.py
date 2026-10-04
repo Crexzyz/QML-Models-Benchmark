@@ -109,9 +109,11 @@ class MultiClassTrainer(BaseTrainer):
             "f1": macro_f1,
             "micro_f1": micro_f1,
             "macro_f1": macro_f1,
+            "balanced_accuracy": macro_recall,
             "per_class_precision": per_class_precision.tolist(),
             "per_class_recall": per_class_recall.tolist(),
             "per_class_f1": per_class_f1.tolist(),
+            "per_class_support": true_per_class.astype(int).tolist(),
         }
 
 
